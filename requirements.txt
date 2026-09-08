@@ -1,0 +1,8 @@
+torch
+torchvision
+numpy
+pandas
+matplotlib
+scipy
+grad-cam
+fathomnet
