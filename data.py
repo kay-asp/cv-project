@@ -382,7 +382,18 @@ def restore_crops():
     os.makedirs(config.CROP_DIR, exist_ok=True)
     with tarfile.open(config.CROP_ARCHIVE) as tar:
         tar.extractall(config.CROP_DIR)
-    print(f"Restored {len(os.listdir(config.CROP_DIR))} crops to {config.DATA_DIR}")
+    print(f"Restored {len(os.listdir(config.CROP_DIR))} crops to {config.CROP_DIR}")
+
+
+def drop_missing_crops(df):
+    """Drop rows whose crop is not on disk (e.g. the source image is no longer
+    downloadable from FathomNet), so every DataLoader sees the same rows."""
+    existing = set(os.listdir(config.CROP_DIR)) if os.path.isdir(config.CROP_DIR) else set()
+    has_crop = [_crop_file(i, a) in existing for i, a in zip(df["image_id"], df["ann_id"])]
+    n_missing = len(has_crop) - sum(has_crop)
+    if n_missing:
+        print(f"Dropping {n_missing} rows with no crop on disk")
+    return df[has_crop].reset_index(drop=True)
 
 
 def _split_of(image_id, seed, val_frac, test_frac):
