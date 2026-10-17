@@ -418,6 +418,8 @@ class CropDataset(Dataset):
         self.paths = [os.path.join(crop_dir, _crop_file(r.image_id, r.ann_id))
                       for r in df.itertuples()]
         self.labels = [species_to_idx[s] for s in df["species"]]
+        self.image_ids = df["image_id"].tolist()
+        self.ann_ids = df["ann_id"].tolist()
         self.transform = transform
 
     def __len__(self):
