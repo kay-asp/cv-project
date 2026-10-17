@@ -210,6 +210,39 @@ def crop_to_bounding_box(image, bbox, margin=config.CROP_MARGIN, mask=None):
     return cropped_image, cropped_mask, (left, top, right, bottom)
 
 
+def show_crop(coco, df, idx=0, margin=config.CROP_MARGIN):
+    """Display one annotation's crop next to the crop with its mask overlaid,
+    to check that crop_to_bounding_box keeps image and mask aligned."""
+    row = df.iloc[idx]
+    img_info = coco.loadImgs(int(row['image_id']))[0]
+    ann = coco.loadAnns([int(row['ann_id'])])[0]
+
+    # download the full image
+    uuid = img_info['file_name'].replace('.png', '')
+    fn_img = fn_images.find_by_uuid(uuid)
+    response = requests.get(fn_img.url)
+    img = Image.open(BytesIO(response.content))
+
+    mask_full = coco.annToMask(ann)
+
+    cropped_img, cropped_mask, box = crop_to_bounding_box(
+        img, row['bbox'], margin=margin, mask=mask_full
+    )
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    axes[0].imshow(cropped_img)
+    axes[0].set_title(f"{row['species']} — crop (margin={margin})")
+    axes[0].axis('off')
+
+    axes[1].imshow(cropped_img)
+    axes[1].imshow(cropped_mask, alpha=0.4, cmap='Reds')
+    axes[1].set_title("crop + mask overlay")
+    axes[1].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+
 def split_shallow_deep(metadata_df, depth_threshold):
     """Split dataset into shallow (≤ threshold) and deep (> threshold).
 
@@ -430,6 +463,40 @@ class CropDataset(Dataset):
         return self.transform(img), self.labels[i]
 
 
+def get_crop_mask(coco, ann_id, bbox):
+    """Organism mask aligned pixel-for-pixel with the saved crop.
+
+    Same steps as show_crop (annToMask -> crop_to_bounding_box),
+    then the IMG_SIZE squash save_crop applied to the image. annToMask only
+    needs the COCO metadata, so no image download: a blank placeholder of the
+    full image size stands in for the image when computing the crop box.
+
+    Returns:
+        uint8 array of shape IMG_SIZE (H, W), 1 = organism.
+    """
+    ann = coco.loadAnns([int(ann_id)])[0]
+    full_mask = coco.annToMask(ann)
+    h, w = full_mask.shape
+    _, mask, _ = crop_to_bounding_box(Image.new("L", (w, h)), bbox, mask=full_mask)
+    # Same resize call as save_crop; NEAREST keeps the mask binary
+    mask = Image.fromarray(mask).resize(config.IMG_SIZE, Image.NEAREST)
+    return np.array(mask, dtype=np.uint8)
+
+
+class MaskedCropDataset(CropDataset):
+    """CropDataset that also yields each crop's organism mask (for CRS)."""
+
+    def __init__(self, df, species_to_idx, crop_dir, transform, coco):
+        super().__init__(df, species_to_idx, crop_dir, transform)
+        self.bboxes = df["bbox"].tolist()
+        self.coco = coco
+
+    def __getitem__(self, i):
+        img, label = super().__getitem__(i)
+        mask = get_crop_mask(self.coco, self.ann_ids[i], self.bboxes[i])
+        return img, label, torch.from_numpy(mask)
+
+
 def _build_transform(train):
     norm = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     if train:
@@ -443,7 +510,7 @@ def _build_transform(train):
 
 
 def get_dataloaders(metadata_df, split="train", batch_size=None,
-                    species_list=None):
+                    species_list=None, coco=None):
     """Build PyTorch DataLoaders with standard augmentation / normalisation.
 
     Args:
@@ -453,12 +520,18 @@ def get_dataloaders(metadata_df, split="train", batch_size=None,
         batch_size: Batch size (default: BATCH_SIZE for train, else EVAL_BATCH_SIZE).
         species_list: class order; defaults to sorted unique species of
             metadata_df. Label index = position in this list.
+        coco: COCO object; if given, batches also include crop-aligned masks
+            (for attribution). Not allowed with split='train', whose random
+            flip would misalign image and mask.
 
     Returns:
-        DataLoader yielding (images, labels). Has a .species_list attribute.
+        DataLoader yielding (images, labels), or (images, labels, masks) when
+        coco is given. Has a .species_list attribute.
     """
     if split not in ("train", "val", "test", "all"):
         raise ValueError(f"split must be train/val/test/all, got {split!r}")
+    if coco is not None and split == "train":
+        raise ValueError("masks are only supported for val/test/all (train augmentation flips images)")
     crop_dir = config.CROP_DIR
     species_list = list(species_list) if species_list is not None else sorted(metadata_df["species"].unique())
     species_to_idx = {s: i for i, s in enumerate(species_list)}
@@ -483,7 +556,11 @@ def get_dataloaders(metadata_df, split="train", batch_size=None,
     if batch_size is None:
         batch_size = config.BATCH_SIZE if split == "train" else config.EVAL_BATCH_SIZE
 
-    ds = CropDataset(df, species_to_idx, crop_dir, _build_transform(train=(split == "train")))
+    transform = _build_transform(train=(split == "train"))
+    if coco is not None:
+        ds = MaskedCropDataset(df, species_to_idx, crop_dir, transform, coco)
+    else:
+        ds = CropDataset(df, species_to_idx, crop_dir, transform)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=(split == "train"),
                         num_workers=config.NUM_WORKERS or os.cpu_count(),
                         persistent_workers=True, prefetch_factor=4,
