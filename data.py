@@ -497,8 +497,45 @@ class MaskedCropDataset(CropDataset):
         return img, label, torch.from_numpy(mask)
 
 
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
+def show_saved_crops(mask_loader, idxs=(0,)):
+    """Display saved crops with their masks exactly as attribution sees them.
+
+    Unlike show_crop (which re-crops the original downloaded image), this reads
+    the 224x224 crops from disk and the masks from get_crop_mask, so it checks
+    that what Grad-CAM / CRS receive is aligned.
+
+    Args:
+        mask_loader: DataLoader built with get_dataloaders(..., coco=coco).
+        idxs: positions in mask_loader.dataset to show.
+    """
+    ds = mask_loader.dataset
+    mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD).view(3, 1, 1)
+    for i in idxs:
+        img, label, mask = ds[i]
+        img = (img * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()  # undo Normalize
+
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+        axes[0].imshow(img)
+        axes[0].set_title(f"{mask_loader.species_list[label]} — saved crop "
+                          f"(image_id {ds.image_ids[i]}, ann_id {ds.ann_ids[i]})")
+        axes[0].axis('off')
+
+        axes[1].imshow(img)
+        axes[1].imshow(mask.numpy(), alpha=0.4, cmap='Reds')
+        axes[1].set_title(f"saved crop + mask ({mask.float().mean():.0%} organism)")
+        axes[1].axis('off')
+
+        plt.tight_layout()
+        plt.show()
+
+
 def _build_transform(train):
-    norm = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    norm = transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
     if train:
         return transforms.Compose([
             transforms.Resize(config.IMG_SIZE),
