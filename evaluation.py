@@ -35,7 +35,7 @@ def predict(model, dataloader):
 
     labels, preds, confs = [], [], []
     with torch.no_grad(), torch.autocast(device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-        for images, batch_labels in dataloader:
+        for images, batch_labels, *_ in dataloader:  # *_ skips masks if the loader has them
             images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
             probs = model(images).float().softmax(dim=1)
             conf, pred = probs.max(dim=1)
