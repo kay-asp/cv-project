@@ -402,20 +402,22 @@ def prepare_crops(df, workers=32, limit=None):
     return n_saved, n_failed
 
 
-def archive_crops():
-    """Pack every crop in CROP_DIR into the shared CROP_ARCHIVE tar."""
-    with tarfile.open(config.CROP_ARCHIVE, "w") as tar:
-        for name in os.listdir(config.CROP_DIR):
-            tar.add(os.path.join(config.CROP_DIR, name), arcname=name)
-    print(f"Saved crop archive to {config.CROP_ARCHIVE}")
+def archive_dir(src_dir, archive_path):
+    """Pack every file in src_dir (e.g. CROP_DIR, MASK_DIR) into the tar at
+    archive_path (e.g. CROP_ARCHIVE, MASK_ARCHIVE) on the Shared Drive."""
+    with tarfile.open(archive_path, "w") as tar:
+        for name in os.listdir(src_dir):
+            if not name.endswith(".tmp"):   # skip half-written files
+                tar.add(os.path.join(src_dir, name), arcname=name)
+    print(f"Saved {src_dir} to {archive_path}")
 
 
-def restore_crops():
-    """Extract CROP_ARCHIVE into CROP_DIR."""
-    os.makedirs(config.CROP_DIR, exist_ok=True)
-    with tarfile.open(config.CROP_ARCHIVE) as tar:
-        tar.extractall(config.CROP_DIR)
-    print(f"Restored {len(os.listdir(config.CROP_DIR))} crops to {config.CROP_DIR}")
+def restore_dir(archive_path, dest_dir):
+    """Extract the tar at archive_path into dest_dir."""
+    os.makedirs(dest_dir, exist_ok=True)
+    with tarfile.open(archive_path) as tar:
+        tar.extractall(dest_dir)
+    print(f"Restored {len(os.listdir(dest_dir))} files to {dest_dir}")
 
 
 def drop_missing_crops(df):
@@ -517,23 +519,6 @@ def prepare_masks(mask_loader):
             n_new += 1
     print(f"Masks: {n_new} newly saved, {len(ds) - n_new} already cached in {config.MASK_DIR}")
     return n_new
-
-
-def archive_masks():
-    """Pack every mask in MASK_DIR into the shared MASK_ARCHIVE tar."""
-    with tarfile.open(config.MASK_ARCHIVE, "w") as tar:
-        for name in os.listdir(config.MASK_DIR):
-            if name.endswith(".png"):   # skip any leftover .tmp files
-                tar.add(os.path.join(config.MASK_DIR, name), arcname=name)
-    print(f"Saved mask archive to {config.MASK_ARCHIVE}")
-
-
-def restore_masks():
-    """Extract MASK_ARCHIVE into MASK_DIR."""
-    os.makedirs(config.MASK_DIR, exist_ok=True)
-    with tarfile.open(config.MASK_ARCHIVE) as tar:
-        tar.extractall(config.MASK_DIR)
-    print(f"Restored {len(os.listdir(config.MASK_DIR))} masks to {config.MASK_DIR}")
 
 
 class MaskedCropDataset(CropDataset):
