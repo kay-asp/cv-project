@@ -402,20 +402,22 @@ def prepare_crops(df, workers=32, limit=None):
     return n_saved, n_failed
 
 
-def archive_crops():
-    """Pack every crop in CROP_DIR into the shared CROP_ARCHIVE tar."""
-    with tarfile.open(config.CROP_ARCHIVE, "w") as tar:
-        for name in os.listdir(config.CROP_DIR):
-            tar.add(os.path.join(config.CROP_DIR, name), arcname=name)
-    print(f"Saved crop archive to {config.CROP_ARCHIVE}")
+def archive_dir(src_dir, archive_path):
+    """Pack every file in src_dir (e.g. CROP_DIR, MASK_DIR) into the tar at
+    archive_path (e.g. CROP_ARCHIVE, MASK_ARCHIVE) on the Shared Drive."""
+    with tarfile.open(archive_path, "w") as tar:
+        for name in os.listdir(src_dir):
+            if not name.endswith(".tmp"):   # skip half-written files
+                tar.add(os.path.join(src_dir, name), arcname=name)
+    print(f"Saved {src_dir} to {archive_path}")
 
 
-def restore_crops():
-    """Extract CROP_ARCHIVE into CROP_DIR."""
-    os.makedirs(config.CROP_DIR, exist_ok=True)
-    with tarfile.open(config.CROP_ARCHIVE) as tar:
-        tar.extractall(config.CROP_DIR)
-    print(f"Restored {len(os.listdir(config.CROP_DIR))} crops to {config.CROP_DIR}")
+def restore_dir(archive_path, dest_dir):
+    """Extract the tar at archive_path into dest_dir."""
+    os.makedirs(dest_dir, exist_ok=True)
+    with tarfile.open(archive_path) as tar:
+        tar.extractall(dest_dir)
+    print(f"Restored {len(os.listdir(dest_dir))} files to {dest_dir}")
 
 
 def drop_missing_crops(df):
@@ -463,7 +465,11 @@ class CropDataset(Dataset):
         return self.transform(img), self.labels[i]
 
 
-def get_crop_mask(coco, ann_id, bbox):
+def _mask_file(image_id, ann_id):
+    return f"{image_id}_{ann_id}.png"
+
+
+def get_crop_mask(coco, image_id, ann_id, bbox):
     """Organism mask aligned pixel-for-pixel with the saved crop.
 
     Same steps as show_crop (annToMask -> crop_to_bounding_box),
@@ -471,16 +477,48 @@ def get_crop_mask(coco, ann_id, bbox):
     needs the COCO metadata, so no image download: a blank placeholder of the
     full image size stands in for the image when computing the crop box.
 
+    Cached: the first call saves the mask to MASK_DIR as a PNG, later calls
+    just load it.
+
     Returns:
         uint8 array of shape IMG_SIZE (H, W), 1 = organism.
     """
+    path = os.path.join(config.MASK_DIR, _mask_file(image_id, ann_id))
+    if os.path.exists(path):
+        return np.array(Image.open(path), dtype=np.uint8)
+
     ann = coco.loadAnns([int(ann_id)])[0]
     full_mask = coco.annToMask(ann)
     h, w = full_mask.shape
     _, mask, _ = crop_to_bounding_box(Image.new("L", (w, h)), bbox, mask=full_mask)
     # Same resize call as save_crop; NEAREST keeps the mask binary
     mask = Image.fromarray(mask).resize(config.IMG_SIZE, Image.NEAREST)
+
+    # Write to a temp file then rename, so an interrupted save never leaves a
+    # half-written PNG that later calls would read as the cached mask
+    os.makedirs(config.MASK_DIR, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    mask.save(tmp, format="PNG")
+    os.replace(tmp, path)
     return np.array(mask, dtype=np.uint8)
+
+
+def prepare_masks(mask_loader):
+    """Compute and cache the mask of every crop in a loader built with
+    get_dataloaders(..., coco=coco). Resumable: cached masks are skipped.
+
+    Returns:
+        Number of masks newly saved (0 if all were already cached).
+    """
+    ds = mask_loader.dataset
+    existing = set(os.listdir(config.MASK_DIR)) if os.path.isdir(config.MASK_DIR) else set()
+    n_new = 0
+    for image_id, ann_id, bbox in zip(ds.image_ids, ds.ann_ids, ds.bboxes):
+        if _mask_file(image_id, ann_id) not in existing:
+            get_crop_mask(ds.coco, image_id, ann_id, bbox)
+            n_new += 1
+    print(f"Masks: {n_new} newly saved, {len(ds) - n_new} already cached in {config.MASK_DIR}")
+    return n_new
 
 
 class MaskedCropDataset(CropDataset):
@@ -493,7 +531,7 @@ class MaskedCropDataset(CropDataset):
 
     def __getitem__(self, i):
         img, label = super().__getitem__(i)
-        mask = get_crop_mask(self.coco, self.ann_ids[i], self.bboxes[i])
+        mask = get_crop_mask(self.coco, self.image_ids[i], self.ann_ids[i], self.bboxes[i])
         return img, label, torch.from_numpy(mask)
 
 

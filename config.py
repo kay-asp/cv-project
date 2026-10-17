@@ -6,7 +6,8 @@ Shared configuration: paths, hyperparameters, depth thresholds.
 CROP_DIR = "/content/crops/"   # Crops, extracted from CROP_ARCHIVE each Colab session (fast VM disk)
 CROP_ARCHIVE = "crops.tar"    # On the Shared Drive, so the group shares one copy
 DATA_DIR = "data/"
-MASK_DIR = "data/masks/"
+MASK_DIR = "/content/masks/"   # Crop-aligned masks, cached by get_crop_mask (fast VM disk, like CROP_DIR)
+MASK_ARCHIVE = "masks.tar"    # On the Shared Drive, like CROP_ARCHIVE
 MODEL_SAVE_PATH = "checkpoints/"
 RESULTS_DIR = "results/"
 
