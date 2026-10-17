@@ -165,18 +165,12 @@ def show_sample(coco, df, idx=0):
     plt.show()
 
 
-def crop_to_bounding_box(image, bbox, margin=config.CROP_MARGIN, mask=None):
-    """Crop image around a bounding box with a surrounding habitat margin.
+def _crop_box(bbox, img_w, img_h, margin=config.CROP_MARGIN):
+    """(left, top, right, bottom) pixel box of the crop around bbox.
 
-    Args:
-        image: PIL Image or numpy array.
-        bbox: (x, y, w, h) bounding box of the organism.
-        margin: Fractional margin to add on each side.
-
-    Returns:
-        Cropped image, adjusted mask (if provided).
+    Depends only on the bbox and image size, so a crop's mask can be rebuilt
+    later without re-downloading the image.
     """
-    img_w, img_h = image.size
     x, y, w, h = bbox  #x,y is is top left corner of box, w,h is its width and height
 
     pad_w = margin * w  #margin is a fraction of box's own size
@@ -193,7 +187,23 @@ def crop_to_bounding_box(image, bbox, margin=config.CROP_MARGIN, mask=None):
             f"Degenerate crop box {bbox} on a {img_w}x{img_h} image "
             f"(check bbox is (x, y, w, h) in that image's own coordinates)."
         )
-    
+    return left, top, right, bottom
+
+
+def crop_to_bounding_box(image, bbox, margin=config.CROP_MARGIN, mask=None):
+    """Crop image around a bounding box with a surrounding habitat margin.
+
+    Args:
+        image: PIL Image or numpy array.
+        bbox: (x, y, w, h) bounding box of the organism.
+        margin: Fractional margin to add on each side.
+
+    Returns:
+        Cropped image, adjusted mask (if provided).
+    """
+    img_w, img_h = image.size
+    left, top, right, bottom = _crop_box(bbox, img_w, img_h, margin)
+
     cropped_image = image.crop((left, top, right, bottom))
 
     #since image cropped, mask must also be cropped to keep them aligned
@@ -428,6 +438,42 @@ class CropDataset(Dataset):
     def __getitem__(self, i):
         img = Image.open(self.paths[i]).convert("RGB")
         return self.transform(img), self.labels[i]
+
+
+class MaskedCropDataset(Dataset):
+    """Wraps a CropDataset and adds each crop's organism mask.
+
+    The mask is the COCO segmentation of the annotation, cropped with the same
+    box as the image and resized to IMG_SIZE (nearest), so it lines up
+    pixel-for-pixel with the saved crop. Yields (image_tensor, label, mask)
+    where mask is a (H, W) uint8 array, 1 = organism.
+    """
+
+    def __init__(self, crop_dataset, coco, species_list):
+        self.crops = crop_dataset
+        self.coco = coco
+        self.species_list = list(species_list)  # label index -> species name
+
+    @classmethod
+    def from_loader(cls, loader, coco):
+        """Build from a get_dataloaders() loader (use split='test', non-shuffled)."""
+        return cls(loader.dataset, coco, loader.species_list)
+
+    def __len__(self):
+        return len(self.crops)
+
+    def __getitem__(self, i):
+        image, label = self.crops[i]
+        return image, label, self.mask(i)
+
+    def mask(self, i):
+        ann = self.coco.loadAnns(self.crops.ann_ids[i])[0]
+        img = self.coco.loadImgs(ann["image_id"])[0]
+        full = self.coco.annToMask(ann)
+        left, top, right, bottom = _crop_box(ann["bbox"], img["width"], img["height"])
+        crop = Image.fromarray(full[top:bottom, left:right])
+        crop = crop.resize(config.IMG_SIZE, Image.NEAREST)  # same squash as save_crop
+        return (np.asarray(crop) > 0).astype(np.uint8)
 
 
 def _build_transform(train):
