@@ -122,47 +122,79 @@ def load_merged_metadata(df_train, df_test, coco_train, coco_test):
 
     return df, coco
 
-def show_sample(coco, df, idx=0):
-    """Display an image with bounding boxes, labels, and mask overlay."""
+def display_image(image, masks=None, bboxes=None, labels=None, title=None,
+                  show_original=False, figsize=None):
+    """Display an image with optional mask overlays, bounding boxes and labels.
 
-    row = df.iloc[idx]
-    img_info = coco.loadImgs(int(row['image_id']))[0]
+    Args:
+        image: PIL Image or (H, W, 3) array.
+        masks: one (H, W) mask or a list of masks (numpy or torch), 1 = organism.
+            Each mask gets its own colour; bboxes[i] is drawn in mask i's colour.
+        bboxes: list of (x, y, w, h) boxes.
+        labels: list of strings, written above the matching box.
+        title: title of the first panel.
+        show_original: also show the plain image on the left, to compare
+            against the overlay.
+        figsize: defaults to (7 * number of panels, 7).
+    """
+    if masks is not None and not isinstance(masks, (list, tuple)):
+        masks = [masks]
+    masks = [np.asarray(m) for m in masks] if masks is not None else []
+    bboxes = bboxes or []
+    labels = labels or []
 
-    # Download the image
-    uuid = img_info['file_name'].replace('.png', '')
-    fn_img = fn_images.find_by_uuid(uuid)
-    response = requests.get(fn_img.url)
-    img = Image.open(BytesIO(response.content))
+    n = max(len(masks), len(bboxes), 1)
+    colors = plt.cm.Set2(np.linspace(0, 1, n))
 
-    # Get all annotations for this image
-    ann_ids = coco.getAnnIds(imgIds=row['image_id'])
-    anns = coco.loadAnns(ann_ids)
-    cat_map = {c['id']: c['name'] for c in coco.dataset['categories']}
+    n_panels = 2 if show_original else 1
+    fig, axes = plt.subplots(1, n_panels, figsize=figsize or (7 * n_panels, 7))
+    axes = np.atleast_1d(axes)
 
-    # Build a combined mask with different colors per annotation
-    combined_mask = np.zeros((*img.size[::-1], 4))  # RGBA
-    colors = plt.cm.Set2(np.linspace(0, 1, len(anns)))
-    for ann, color in zip(anns, colors):
-        mask = coco.annToMask(ann)
-        combined_mask[mask == 1] = [*color[:3], 0.4]
+    if show_original:
+        axes[0].imshow(image)
+        axes[0].set_title(title or "")
 
-    fig, ax = plt.subplots(1, figsize=(14, 10))
-    ax.imshow(img)
-    ax.imshow(combined_mask)
+    ax = axes[-1]
+    ax.imshow(image)
+    if masks:
+        overlay = np.zeros((*masks[0].shape[:2], 4))  # RGBA
+        for mask, color in zip(masks, colors):
+            overlay[mask == 1] = [*color[:3], 0.4]
+        ax.imshow(overlay)
 
-    for ann, color in zip(anns, colors):
-        x, y, w, h = ann['bbox']
-        rect = patches.Rectangle((x, y), w, h, linewidth=2,
-                                  edgecolor=color, facecolor='none')
-        ax.add_patch(rect)
-        ax.text(x, y - 5, cat_map[ann['category_id']],
-                color='white', fontsize=9,
-                bbox=dict(facecolor=color, alpha=0.7, pad=2))
+    for k, (bbox, color) in enumerate(zip(bboxes, colors)):
+        x, y, w, h = bbox
+        ax.add_patch(patches.Rectangle((x, y), w, h, linewidth=2,
+                                       edgecolor=color, facecolor='none'))
+        if k < len(labels):
+            ax.text(x, y - 5, labels[k], color='white', fontsize=9,
+                    bbox=dict(facecolor=color, alpha=0.7, pad=2))
 
-    ax.set_title(f"image_id: {row['image_id']} | depth: {row.get('depth_m', '?')}m")
-    ax.axis('off')
+    if not show_original:
+        ax.set_title(title or "")
+    elif masks:
+        organism = np.any([m == 1 for m in masks], axis=0).mean()
+        ax.set_title(f"+ mask overlay ({organism:.0%} organism)")
+
+    for a in axes:
+        a.axis('off')
     plt.tight_layout()
     plt.show()
+
+
+def show_sample(coco, df, idx=0):
+    """Display an image with bounding boxes, labels, and mask overlay."""
+    row = df.iloc[idx]
+    img = get_image(coco, row['image_id'])
+
+    anns = coco.loadAnns(coco.getAnnIds(imgIds=row['image_id']))
+    cat_map = {c['id']: c['name'] for c in coco.dataset['categories']}
+    display_image(img,
+                  masks=[coco.annToMask(a) for a in anns],
+                  bboxes=[a['bbox'] for a in anns],
+                  labels=[cat_map[a['category_id']] for a in anns],
+                  title=f"image_id: {row['image_id']} | depth: {row.get('depth_m', '?')}m",
+                  figsize=(14, 10))
 
 
 def crop_to_bounding_box(image, bbox, margin=config.CROP_MARGIN, mask=None):
@@ -210,49 +242,9 @@ def crop_to_bounding_box(image, bbox, margin=config.CROP_MARGIN, mask=None):
     return cropped_image, cropped_mask, (left, top, right, bottom)
 
 
-def show_crop(coco, df, idx=0, margin=config.CROP_MARGIN):
-    """Display one annotation's crop next to the crop with its mask overlaid,
-    to check that crop_to_bounding_box keeps image and mask aligned."""
-    row = df.iloc[idx]
-    img_info = coco.loadImgs(int(row['image_id']))[0]
-    ann = coco.loadAnns([int(row['ann_id'])])[0]
-
-    # download the full image
-    uuid = img_info['file_name'].replace('.png', '')
-    fn_img = fn_images.find_by_uuid(uuid)
-    response = requests.get(fn_img.url)
-    img = Image.open(BytesIO(response.content))
-
-    mask_full = coco.annToMask(ann)
-
-    cropped_img, cropped_mask, box = crop_to_bounding_box(
-        img, row['bbox'], margin=margin, mask=mask_full
-    )
-
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-    axes[0].imshow(cropped_img)
-    axes[0].set_title(f"{row['species']} — crop (margin={margin})")
-    axes[0].axis('off')
-
-    axes[1].imshow(cropped_img)
-    axes[1].imshow(cropped_mask, alpha=0.4, cmap='Reds')
-    axes[1].set_title("crop + mask overlay")
-    axes[1].axis('off')
-
-    plt.tight_layout()
-    plt.show()
-
-
 def split_shallow_deep(metadata_df, depth_threshold):
-    """Split dataset into shallow (≤ threshold) and deep (> threshold).
+    """Split dataset into shallow (≤ threshold) and deep (> threshold)"""
 
-    Args:
-        metadata_df: DataFrame with a 'depth_m' column.
-        depth_threshold: Maximum depth considered 'shallow'.
-
-    Returns:
-        shallow_df, deep_df
-    """
     #number of rows with missing depth
     n_missing = metadata_df['depth_m'].isna().sum()
 
@@ -327,11 +319,8 @@ def _crop_file(image_id, ann_id):
 
 
 def save_crop(crop, path):
-    """Resize a crop to config.IMG_SIZE and save it as JPEG.
-
-    Doing the resize once here (instead of in every epoch's transform) is the
-    same squash transforms.Resize(IMG_SIZE) applied before, just paid once.
-    """
+    """Resize a crop to config.IMG_SIZE and save it as JPEG """
+    
     crop = crop.convert("RGB").resize(config.IMG_SIZE, Image.BILINEAR)
     crop.save(path, quality=getattr(config, "CROP_JPEG_QUALITY", 95))
 
@@ -349,21 +338,22 @@ def _download_image(uuid, retries=3):
     return None
 
 
+def get_image(coco, image_id):
+    """Download one full FathomNet image (with retries) as an RGB PIL image."""
+    file_name = coco.loadImgs(int(image_id))[0]['file_name']
+    img = _download_image(file_name.replace('.png', ''))
+    if img is None:
+        raise RuntimeError(f"Could not download image {image_id}")
+    return img
+
+
 def prepare_crops(df, workers=32, limit=None):
     """Download each image once, crop every annotation on it (with the habitat
     margin) and save the crops as IMG_SIZE JPEGs. Resumable: crops already on
     disk are skipped, so it is safe to re-run after a disconnect.
 
-    Slow (hours for the full dataset). Prefer extracting crops_224.tar made
-    by pack_crops.py; this is the fallback when that archive isn't available.
-
-    Args:
-        df: needs columns image_id, file_name, ann_id, bbox.
-        workers: parallel download threads.
-        limit: only process this many images (use ~20 as a smoke test first).
-
-    Returns:
-        (n_saved, n_failed) annotation counts for this call.
+    limit - for smoke test
+    returns (n_saved, n_failed) annotation counts for this call.
     """
     
     os.makedirs(config.CROP_DIR, exist_ok=True)
@@ -472,7 +462,7 @@ def _mask_file(image_id, ann_id):
 def get_crop_mask(coco, image_id, ann_id, bbox):
     """Organism mask aligned pixel-for-pixel with the saved crop.
 
-    Same steps as show_crop (annToMask -> crop_to_bounding_box),
+    Same steps as the notebook's crop check (annToMask -> crop_to_bounding_box),
     then the IMG_SIZE squash save_crop applied to the image. annToMask only
     needs the COCO metadata, so no image download: a blank placeholder of the
     full image size stands in for the image when computing the crop box.
@@ -542,7 +532,8 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 def show_saved_crops(mask_loader, idxs=(0,)):
     """Display saved crops with their masks exactly as attribution sees them.
 
-    Unlike show_crop (which re-crops the original downloaded image), this reads
+    Unlike the crop check in the notebook (which re-crops the original
+    downloaded image), this reads
     the 224x224 crops from disk and the masks from get_crop_mask, so it checks
     that what Grad-CAM / CRS receive is aligned.
 
@@ -556,20 +547,9 @@ def show_saved_crops(mask_loader, idxs=(0,)):
     for i in idxs:
         img, label, mask = ds[i]
         img = (img * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()  # undo Normalize
-
-        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-        axes[0].imshow(img)
-        axes[0].set_title(f"{mask_loader.species_list[label]} — saved crop "
-                          f"(image_id {ds.image_ids[i]}, ann_id {ds.ann_ids[i]})")
-        axes[0].axis('off')
-
-        axes[1].imshow(img)
-        axes[1].imshow(mask.numpy(), alpha=0.4, cmap='Reds')
-        axes[1].set_title(f"saved crop + mask ({mask.float().mean():.0%} organism)")
-        axes[1].axis('off')
-
-        plt.tight_layout()
-        plt.show()
+        display_image(img, masks=mask.numpy(), show_original=True,
+                      title=f"{mask_loader.species_list[label]} — saved crop "
+                            f"(image_id {ds.image_ids[i]}, ann_id {ds.ann_ids[i]})")
 
 
 def _build_transform(train):

@@ -20,15 +20,8 @@ import config
 
 
 def build_classifier(num_classes, pretrained=config.PRETRAINED):
-    """Create a ResNet-50 with a fresh classification head.
+    # create ResNet-50 with fresh classification head
 
-    Args:
-        num_classes: Number of species classes.
-        pretrained: Whether to use ImageNet weights.
-
-    Returns:
-        torch.nn.Module
-    """
     weights = models.ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
     net = models.resnet50(weights=weights)
     net.fc = nn.Linear(net.fc.in_features, num_classes)
@@ -36,21 +29,8 @@ def build_classifier(num_classes, pretrained=config.PRETRAINED):
 
 
 def train(model, train_loader, val_loader, epochs, lr, resume_path):
-    """Fine-tune the model on shallow-depth crops.
+    # fine-tune the model on shallow-depth crops
 
-    Args:
-        model: The classifier.
-        train_loader: Training DataLoader yielding (images, labels) batches,
-            where labels are integer indices into the species list used to
-            build the model's classification head.
-        val_loader: Validation DataLoader (same contract as train_loader).
-        epochs: Number of training epochs.
-        lr: Learning rate.
-        resume_path: File for per-epoch training state (resumes if it exists), or None.
-
-    Returns:
-        Trained model (best validation weights loaded), training history dict.
-    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device, memory_format=torch.channels_last)
     torch.backends.cudnn.benchmark = True
@@ -158,28 +138,16 @@ def train(model, train_loader, val_loader, epochs, lr, resume_path):
 
 
 def save_checkpoint(model, path):
-    """Save model weights to disk, creating parent directories if needed."""
+    # save model weights to disk, creating parent directories if needed
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(model.state_dict(), path)
 
 
 def load_checkpoint(model, path):
-    """Load model weights from disk onto the current device."""
+    # load model weights from disk onto the current device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     state_dict = torch.load(path, map_location=device)
     model.load_state_dict(state_dict)
     return model.to(device)
 
 
-def build_control_model(num_classes):
-    """Build the control classifier trained on ALL depths.
-
-    Same architecture as the shallow-only classifier — the point of the
-    control is to hold architecture and training procedure fixed and vary
-    only the training distribution, so degradation differences can be
-    attributed to distribution shift rather than model capacity.
-
-    Returns:
-        torch.nn.Module (untrained — call train() separately)
-    """
-    return build_classifier(num_classes, pretrained=config.PRETRAINED)
