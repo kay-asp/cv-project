@@ -161,19 +161,73 @@ def compute_species_crs(model, dataloader, species_list, target_layer=config.GRA
     return result
 
 
-def generate_uniform_baseline(shape):
+def generate_uniform_baseline(shape, rng=None):
     """Uniform random attribution map (baseline for CRS comparison).
+    
+    A map that "looks everywhere equally". Its CRS is roughly the fraction of
+    the crop that is background, so it tells us what CRS a meaningless
+    attribution gets purely from how big the organism is in the crop.
 
     Returns:
         numpy array of given shape with uniform random values.
     """
-    raise NotImplementedError
+    rng = rng if rng is not None else np.random.default_rng()
+    return rng.random(shape)
+    
 
 
 def generate_gaussian_baseline(shape, sigma=None):
     """Centre-Gaussian attribution map (captures centre-bias baseline).
+    
+    A map that only "looks at the middle". Because every crop is centred on
+    its organism, this is what CRS looks like for a model that ignores the
+    image content and just attends to the centre.
 
     Returns:
         numpy array of given shape with Gaussian blob centred on the image.
     """
-    raise NotImplementedError
+    h, w = shape
+    if sigma is None:
+        sigma = 0.25 * min(h, w)
+    y = np.arange(h) - (h - 1) / 2
+    x = np.arange(w) - (w - 1) / 2
+    yy, xx = np.meshgrid(y, x, indexing="ij")
+    return np.exp(-(xx ** 2 + yy ** 2) / (2 * sigma ** 2))
+    
+def compute_species_baseline_crs(mask_loader, species_list, kind, seed=config.RANDOM_SEED,
+                                 sigma=None):
+    """Per-species CRS of a trivial baseline map, on the same images and masks
+    as compute_species_crs, so the numbers are directly comparable.
+ 
+    Args:
+        mask_loader: Same shallow-test loader passed to compute_species_crs
+            (built with data.get_dataloaders(..., coco=coco)).
+        species_list: Class order (label index = position).
+        kind: 'uniform' or 'gaussian'.
+        seed: Random seed for the uniform maps.
+        sigma: Gaussian width in pixels (see generate_gaussian_baseline).
+ 
+    Returns:
+        dict mapping species -> mean baseline CRS (nan if no images).
+    """
+    import data  # local import: data imports config/torch, avoid circular imports
+ 
+    if kind not in ("uniform", "gaussian"):
+        raise ValueError(f"kind must be 'uniform' or 'gaussian', got {kind!r}")
+    ds = mask_loader.dataset
+    rng = np.random.default_rng(seed)
+    gauss = generate_gaussian_baseline(config.IMG_SIZE, sigma) if kind == "gaussian" else None
+ 
+    crs = np.empty(len(ds.ann_ids))
+    for i, (image_id, ann_id, bbox) in enumerate(zip(ds.image_ids, ds.ann_ids, ds.bboxes)):
+        mask = data.get_crop_mask(ds.coco, image_id, ann_id, bbox)
+        heatmap = gauss if kind == "gaussian" else generate_uniform_baseline(mask.shape, rng)
+        crs[i] = compute_crs(heatmap, mask)
+ 
+    labels = np.asarray(ds.labels)
+    result = {}
+    for idx, species in enumerate(species_list):
+        vals = crs[(labels == idx) & np.isfinite(crs)]
+        result[species] = float(vals.mean()) if len(vals) else float("nan")
+    print(f"{kind} baseline CRS: scored {int(np.isfinite(crs).sum())} / {len(crs)} images")
+    return result
