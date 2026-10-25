@@ -42,7 +42,7 @@ def _device():
 def _save(fig, save_path):
     if save_path:
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
 
 
 # ── 1. Background intervention ───────────────────────────────────────
@@ -284,7 +284,7 @@ def plot_intervention_summary(summary, save_path=None):
     """One panel per model: mean per-species accuracy under each mode,
     shallow vs deep test crops."""
     models = summary.index.get_level_values("model").unique()
-    fig, axes = plt.subplots(1, len(models), figsize=(6 * len(models), 4.5),
+    fig, axes = plt.subplots(1, len(models), figsize=(3.4 * len(models), 2.8),
                              sharey=True, squeeze=False)
     for ax, model in zip(axes[0], models):
         s = summary.loc[model]
@@ -294,16 +294,17 @@ def plot_intervention_summary(summary, save_path=None):
             vals = s[f"{split}_acc"].values
             bars = ax.bar(x + offset, vals, width=w - 0.04, color=SPLIT_COLORS[split],
                           label=f"{split.capitalize()} test crops")
-            ax.bar_label(bars, fmt="%.2f", fontsize=8, color=INK_MUTED, padding=2)
-        ax.set_xticks(x, s.index, rotation=15)
-        ax.set_title(f"{model.capitalize()} model", fontsize=11)
+            ax.bar_label(bars, fmt="%.2f", fontsize=6, color=INK_MUTED, padding=2)
+        ax.set_xticks(x, s.index, rotation=20)
+        ax.set_title(f"{model.capitalize()} model", fontsize=8)
         ax.spines[["top", "right"]].set_visible(False)
+        ax.tick_params(labelsize=7)
         ax.grid(axis="y", alpha=0.25)
-    axes[0][0].set_ylabel("Mean per-species accuracy")
+    axes[0][0].set_ylabel("Mean per-species accuracy", fontsize=8)
     handles, labels = axes[0][0].get_legend_handles_labels()
-    fig.suptitle("Accuracy when background or organism is removed", fontsize=12, y=1.04)
+    fig.suptitle("Accuracy when background or organism is removed", fontsize=8, y=1.04)
     fig.legend(handles, labels, loc="upper center", ncol=2, frameon=False,
-               bbox_to_anchor=(0.5, 0.99))
+               bbox_to_anchor=(0.5, 0.99), fontsize=7)
     plt.tight_layout()
     _save(fig, save_path)
     plt.show()
@@ -526,19 +527,20 @@ def plot_crs_correct_vs_incorrect(image_crs_by_split, species=None, save_path=No
             labels.append(f"{split.capitalize()}\n{word}\n(n={len(v)})")
             colors.append(SPLIT_COLORS.get(split, INK_MUTED))
 
-    fig, ax = plt.subplots(figsize=(1.8 * len(groups) + 1, 4.8))
+    fig, ax = plt.subplots(figsize=(0.8 * len(groups) + 0.7, 2.8))
     bp = ax.boxplot(groups, widths=0.55, showfliers=False, patch_artist=True,
-                    medianprops=dict(color="white", linewidth=2))
+                    medianprops=dict(color="white", linewidth=1.5))
     for patch, c in zip(bp["boxes"], colors):
         patch.set(facecolor=c, edgecolor=c)
     for part in ("whiskers", "caps"):
         for line in bp[part]:
             line.set_color(INK_MUTED)
     ax.set_xticks(range(1, len(groups) + 1), labels)
-    ax.set_ylabel("Per-image CRS (true species)")
+    ax.set_ylabel("Per-image CRS", fontsize=8)
     ax.set_ylim(0, 1)
-    ax.set_title("Context reliance on correct vs wrong predictions", fontsize=11)
+    ax.set_title("Context reliance on correct vs wrong predictions", fontsize=8)
     ax.spines[["top", "right"]].set_visible(False)
+    ax.tick_params(labelsize=7)
     ax.grid(axis="y", alpha=0.25)
     plt.tight_layout()
     _save(fig, save_path)
@@ -594,26 +596,259 @@ def plot_crs_variance_vs_degradation(var_df, metric="std", rho=None, p_value=Non
     ok = x.notna() & y.notna()
     x, y = x[ok], y[ok]
 
-    fig, ax = plt.subplots(figsize=(7, 5.5))
-    ax.axhline(0, color="#bbbbbb", linewidth=1, zorder=0)
-    ax.scatter(x, y, s=28, color=SPLIT_COLORS["shallow"], alpha=0.7,
-               edgecolor="white", linewidth=0.8)
+    fig, ax = plt.subplots(figsize=(3.4, 2.8))
+    ax.axhline(0, color="#bbbbbb", linewidth=0.8, zorder=0)
+    ax.scatter(x, y, s=12, color=SPLIT_COLORS["shallow"], alpha=0.7,
+               edgecolor="white", linewidth=0.4)
 
     z = ((x - x.mean()) / x.std()) ** 2 + ((y - y.mean()) / y.std()) ** 2
     for s in z.sort_values(ascending=False).index[:n_labels]:
-        ax.annotate(s, (x[s], y[s]), xytext=(4, 4), textcoords="offset points",
-                    fontsize=8, color=INK_MUTED)
+        ax.annotate(s, (x[s], y[s]), xytext=(5, 5), textcoords="offset points",
+                    fontsize=6, color=INK_MUTED)
 
     metric_label = {"std": "CRS standard deviation", "iqr": "CRS interquartile range",
                     "mean": "CRS mean"}[metric]
     title = "Within-species CRS variability vs depth degradation"
     if rho is not None:
-        title += f"\nSpearman ρ = {rho:.3f}, p = {p_value:.3g}, n = {len(x)} species"
-    ax.set_title(title, fontsize=11)
-    ax.set_xlabel(f"{metric_label} (shallow test, Grad-CAM)")
-    ax.set_ylabel("Degradation (shallow acc − deep acc)")
+        title += f"\nρ = {rho:.3f}, p = {p_value:.3g}, n = {len(x)}"
+    ax.set_title(title, fontsize=8, pad=6)
+    ax.set_xlabel(metric_label, fontsize=8)
+    ax.set_ylabel("Degradation", fontsize=8)
     ax.spines[["top", "right"]].set_visible(False)
+    ax.tick_params(labelsize=7)
     ax.grid(alpha=0.25)
+    plt.tight_layout()
+    _save(fig, save_path)
+    plt.show()
+    return fig
+
+
+# ── 5. CRS adjusted for mask size ────────────────────────────────────
+
+def crs_mask_size_analysis(crs_scores, uniform_crs, degradation_scores,
+                           species=None):
+    """Test whether CRS is driven by mask size and re-test after normalising.
+
+    The uniform-random CRS for a species equals (1 − mean mask coverage),
+    so normalised CRS = raw CRS / uniform CRS scales out the geometric
+    effect of mask size.  A value of 1 means the model is no more
+    context-reliant than a random attribution map; above 1 means genuinely
+    reliant on background.
+
+    Args:
+        crs_scores: dict species -> Grad-CAM CRS.
+        uniform_crs: dict species -> uniform-baseline CRS (= 1 − coverage).
+        degradation_scores: dict species -> degradation.
+        species: optional list to restrict to.
+
+    Returns:
+        (per-species DataFrame, dict metric -> (rho, p, n))
+    """
+    names = species if species is not None else sorted(
+        set(crs_scores) & set(uniform_crs) & set(degradation_scores))
+    df = pd.DataFrame({
+        "crs": {s: crs_scores.get(s) for s in names},
+        "uniform_crs": {s: uniform_crs.get(s) for s in names},
+        "degradation": {s: degradation_scores.get(s) for s in names},
+    }).dropna()
+    df["mask_coverage"] = 1 - df["uniform_crs"]
+    df["normalised_crs"] = df["crs"] / df["uniform_crs"].clip(lower=1e-6)
+
+    results = {}
+    rho, p = spearmanr(df["mask_coverage"], df["crs"])
+    results["coverage_vs_crs"] = (float(rho), float(p), len(df))
+    print(f"Mask coverage vs CRS: ρ = {rho:.3f}, p = {p:.3g}, n = {len(df)}")
+
+    rho, p = spearmanr(df["crs"], df["degradation"])
+    results["raw_crs_vs_degradation"] = (float(rho), float(p), len(df))
+    print(f"Raw CRS vs degradation: ρ = {rho:.3f}, p = {p:.3g}, n = {len(df)}")
+
+    rho, p = spearmanr(df["normalised_crs"], df["degradation"])
+    results["normalised_crs_vs_degradation"] = (float(rho), float(p), len(df))
+    print(f"Normalised CRS vs degradation: ρ = {rho:.3f}, p = {p:.3g}, n = {len(df)}")
+
+    return df, results
+
+
+def plot_normalised_crs_vs_degradation(adj_df, rho=None, p_value=None,
+                                       n_labels=5, save_path=None):
+    """Scatter: mask-size-normalised CRS vs degradation."""
+    x, y = adj_df["normalised_crs"], adj_df["degradation"]
+    ok = x.notna() & y.notna()
+    x, y = x[ok], y[ok]
+
+    fig, ax = plt.subplots(figsize=(3.4, 2.8))
+    ax.axhline(0, color="#bbbbbb", linewidth=0.8, zorder=0)
+    ax.axvline(1, color="#bbbbbb", linewidth=0.8, linestyle="--", zorder=0)
+    ax.scatter(x, y, s=12, color=SPLIT_COLORS["shallow"], alpha=0.7,
+               edgecolor="white", linewidth=0.4)
+
+    z = ((x - x.mean()) / x.std()) ** 2 + ((y - y.mean()) / y.std()) ** 2
+    for s in z.sort_values(ascending=False).index[:n_labels]:
+        ax.annotate(s, (x[s], y[s]), xytext=(5, 5), textcoords="offset points",
+                    fontsize=6, color=INK_MUTED)
+
+    title = "Normalised CRS vs depth degradation"
+    if rho is not None:
+        title += f"\nρ = {rho:.3f}, p = {p_value:.3g}, n = {len(x)}"
+    ax.set_title(title, fontsize=8, pad=6)
+    ax.set_xlabel("Normalised CRS (observed / expected)", fontsize=8)
+    ax.set_ylabel("Degradation", fontsize=8)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.tick_params(labelsize=7)
+    ax.grid(alpha=0.25)
+    plt.tight_layout()
+    _save(fig, save_path)
+    plt.show()
+    return fig
+
+
+# ── 6. Degradation driven by context reliance? ──────────────────────
+
+def degradation_context_analysis(preds, degradation_scores, species=None,
+                                 model="shallow", mode="grey_bg"):
+    """For species that degrade at depth, is it because they relied on
+    background in shallow water?
+
+    Per species, computes:
+      - bg_reliance: shallow accuracy drop when background is removed
+        (higher = the model leaned on background more in shallow water).
+      - reduction: how much removing background shrinks the shallow-to-deep
+        gap (higher = background cues explained more of the degradation).
+
+    Then tests Spearman correlation between degradation and each metric.
+
+    Args:
+        preds: intervention predictions DataFrame.
+        degradation_scores: dict species -> degradation.
+        species: optional list to restrict to.
+        model: which model to analyse.
+        mode: intervention mode ('grey_bg' or 'blur_bg').
+
+    Returns:
+        (per-species DataFrame, dict metric -> (rho, p, n))
+    """
+    wide = intervention_per_species(preds, species)
+    sh_orig = f"{model}_shallow_none"
+    dp_orig = f"{model}_deep_none"
+    sh_edit = f"{model}_shallow_{mode}"
+    dp_edit = f"{model}_deep_{mode}"
+    needed = [sh_orig, dp_orig, sh_edit, dp_edit]
+    if not all(c in wide for c in needed):
+        raise ValueError(f"Missing columns; need {needed}")
+
+    df = wide[needed].dropna()
+    deg = pd.Series(degradation_scores).reindex(df.index).dropna()
+    df = df.reindex(deg.index).dropna()
+
+    df["degradation"] = deg
+    df["bg_reliance"] = df[sh_orig] - df[sh_edit]
+    df["degradation_original"] = df[sh_orig] - df[dp_orig]
+    df["degradation_edited"] = df[sh_edit] - df[dp_edit]
+    df["reduction"] = df["degradation_original"] - df["degradation_edited"]
+
+    results = {}
+    for metric, label in (("bg_reliance", "Background reliance vs degradation"),
+                          ("reduction", "Degradation reduction vs degradation")):
+        rho, p = spearmanr(df[metric], df["degradation"])
+        results[metric] = (float(rho), float(p), len(df))
+        print(f"{label}: ρ = {rho:.3f}, p = {p:.3g}, n = {len(df)}")
+
+    return df, results
+
+
+def _bin_degradation(df, n_bins, orig_col="degradation_original",
+                     edit_col="degradation_edited"):
+    """Bin species by original degradation and return binned means."""
+    ok = df[orig_col].notna() & df[edit_col].notna()
+    sub = df.loc[ok].copy()
+    sub["bin"] = pd.qcut(sub[orig_col], n_bins, duplicates="drop")
+    sub["bin_mid"] = sub["bin"].apply(lambda b: b.mid)
+    orig = sub.groupby("bin_mid")[orig_col].mean()
+    edit = sub.groupby("bin_mid")[edit_col].mean()
+    return orig, edit
+
+
+def plot_degradation_before_after(df_grey, df_blur=None, n_bins=15,
+                                  save_path=None):
+    """Line plot: degradation (y) vs original degradation (x) for
+    original, background-removed, and background-blurred conditions.
+
+    Species are sorted by original degradation and smoothed into
+    equal-frequency bins so the trend is readable on a continuous axis.
+    """
+    orig, grey = _bin_degradation(df_grey, n_bins)
+
+    fig, ax = plt.subplots(figsize=(3.4, 2.8))
+    ax.axhline(0, color="#bbbbbb", linewidth=0.8, zorder=0)
+
+    ax.plot(orig.index, orig.values, marker="o", markersize=3,
+            linewidth=1.2, color=SPLIT_COLORS["shallow"], label="Original")
+    ax.plot(grey.index, grey.values, marker="s", markersize=3,
+            linewidth=1.2, color="#8b5cf6", label="Bg removed")
+
+    if df_blur is not None:
+        _, blur = _bin_degradation(df_blur, n_bins)
+        ax.plot(blur.index, blur.values, marker="^", markersize=3,
+                linewidth=1.2, color="#eb6834", label="Bg blurred")
+
+    ax.set_xlabel("Original degradation", fontsize=8)
+    ax.set_ylabel("Degradation", fontsize=8)
+    ax.set_title("Effect of background removal on\ndepth degradation",
+                 fontsize=8, pad=6)
+    ax.legend(fontsize=7, frameon=False)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.tick_params(labelsize=7)
+    ax.grid(alpha=0.25)
+    plt.tight_layout()
+    _save(fig, save_path)
+    plt.show()
+    return fig
+
+
+def plot_degradation_bar(df, mode_label="background removed",
+                         n_bins=3, save_path=None):
+    """Grouped bar chart: mean degradation before vs after background
+    removal, binned by original degradation magnitude."""
+    ok = df["degradation_original"].notna() & df["degradation_edited"].notna()
+    sub = df.loc[ok].copy()
+
+    labels = {3: ["Low", "Medium", "High"],
+              4: ["Q1", "Q2", "Q3", "Q4"]}.get(
+        n_bins, [f"Bin {i+1}" for i in range(n_bins)])
+    sub["bin"] = pd.qcut(sub["degradation_original"], n_bins,
+                         labels=labels, duplicates="drop")
+    labels = [l for l in labels if l in sub["bin"].values]
+
+    orig_m, edit_m, counts = [], [], []
+    for lab in labels:
+        g = sub[sub["bin"] == lab]
+        orig_m.append(g["degradation_original"].mean())
+        edit_m.append(g["degradation_edited"].mean())
+        counts.append(len(g))
+
+    pos = np.arange(len(labels))
+    w = 0.32
+
+    fig, ax = plt.subplots(figsize=(3.4, 2.8))
+    bars1 = ax.bar(pos - w / 2, orig_m, width=w - 0.04,
+                   color=SPLIT_COLORS["shallow"], label="Original")
+    bars2 = ax.bar(pos + w / 2, edit_m, width=w - 0.04,
+                   color=SPLIT_COLORS["deep"],
+                   label=mode_label.capitalize())
+    ax.bar_label(bars1, fmt="%.3f", fontsize=6, color=INK_MUTED, padding=2)
+    ax.bar_label(bars2, fmt="%.3f", fontsize=6, color=INK_MUTED, padding=2)
+
+    ax.set_xticks(pos, [f"{l}\n(n={n})" for l, n in zip(labels, counts)])
+    ax.set_ylabel("Mean degradation", fontsize=8)
+    ax.set_xlabel("Original degradation bin", fontsize=8)
+    ax.set_title(f"Depth degradation before and after\n{mode_label}",
+                 fontsize=8, pad=6)
+    ax.legend(fontsize=7, frameon=False)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.tick_params(labelsize=7)
+    ax.axhline(0, color="#bbbbbb", linewidth=0.8, zorder=0)
+    ax.grid(axis="y", alpha=0.25)
     plt.tight_layout()
     _save(fig, save_path)
     plt.show()

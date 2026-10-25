@@ -80,28 +80,29 @@ def plot_crs_vs_degradation(crs_scores, degradation_scores, species=None,
         save_path: If provided, save the figure to this path.
     """
     x, y = _paired(crs_scores, degradation_scores, species)
-    fig, ax = plt.subplots(figsize=(7, 5.5))
-    ax.axhline(0, color="#bbbbbb", linewidth=1, zorder=0)
-    ax.scatter(x, y, s=28, color=MARK_COLOR, alpha=0.7,
-               edgecolor="white", linewidth=0.8)
+    fig, ax = plt.subplots(figsize=(3.4, 2.8))
+    ax.axhline(0, color="#bbbbbb", linewidth=0.8, zorder=0)
+    ax.scatter(x, y, s=12, color=MARK_COLOR, alpha=0.7,
+               edgecolor="white", linewidth=0.4)
  
     z = ((x - x.mean()) / x.std()) ** 2 + ((y - y.mean()) / y.std()) ** 2
     for s in z.sort_values(ascending=False).index[:n_labels]:
-        ax.annotate(s, (x[s], y[s]), xytext=(4, 4), textcoords="offset points",
-                    fontsize=8, color=INK_MUTED)
+        ax.annotate(s, (x[s], y[s]), xytext=(5, 5), textcoords="offset points",
+                    fontsize=6, color=INK_MUTED)
  
     title = "Context reliance vs depth degradation"
     if rho is not None:
-        title += f"\nSpearman ρ = {rho:.3f}, p = {p_value:.3g}, n = {len(x)} species"
-    ax.set_title(title, fontsize=11)
-    ax.set_xlabel("Context Reliance Score (shallow test, Grad-CAM)")
-    ax.set_ylabel("Degradation (shallow acc − deep acc)")
+        title += f"\nρ = {rho:.3f}, p = {p_value:.3g}, n = {len(x)}"
+    ax.set_title(title, fontsize=8, pad=6)
+    ax.set_xlabel("Context Reliance Score", fontsize=8)
+    ax.set_ylabel("Degradation", fontsize=8)
     ax.spines[["top", "right"]].set_visible(False)
+    ax.tick_params(labelsize=7)
     ax.grid(alpha=0.25)
     plt.tight_layout()
     if save_path:
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-        fig.savefig(save_path, dpi=150)
+        fig.savefig(save_path, dpi=300)
     plt.show()
     return fig
 
@@ -120,35 +121,117 @@ def plot_baseline_comparison(crs_scores, uniform_crs, gaussian_crs, species=None
     values = [pd.Series({s: d.get(s, np.nan) for s in names}).dropna().values
               for d in cols.values()]
  
-    fig, ax = plt.subplots(figsize=(7, 5))
+    fig, ax = plt.subplots(figsize=(3.4, 2.6))
     ax.boxplot(values, widths=0.5, showfliers=False,
                medianprops=dict(color=MARK_COLOR, linewidth=2),
                boxprops=dict(color=INK_MUTED), whiskerprops=dict(color=INK_MUTED),
                capprops=dict(color=INK_MUTED))
     rng = np.random.default_rng(0)
     for i, v in enumerate(values, start=1):
-        ax.scatter(i + rng.uniform(-0.15, 0.15, len(v)), v, s=8,
+        ax.scatter(i + rng.uniform(-0.15, 0.15, len(v)), v, s=4,
                    color=MARK_COLOR, alpha=0.35, linewidth=0)
     ax.set_xticks(range(1, len(cols) + 1), list(cols))
-    ax.set_ylabel("Per-species CRS (fraction of map outside mask)")
+    ax.set_ylabel("Per-species CRS", fontsize=8)
     ax.set_ylim(0, 1)
-    ax.set_title("CRS: Grad-CAM vs trivial attribution maps", fontsize=11)
+    ax.set_title("CRS: Grad-CAM vs trivial attribution maps", fontsize=8)
     ax.spines[["top", "right"]].set_visible(False)
+    ax.tick_params(labelsize=7)
     ax.grid(axis="y", alpha=0.25)
     plt.tight_layout()
     if save_path:
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-        fig.savefig(save_path, dpi=150)
+        fig.savefig(save_path, dpi=300)
     plt.show()
     return fig
 
 
-def plot_control_comparison(main_degradation, control_degradation, save_path=None):
-    """Compare degradation of shallow-only model vs all-depths control.
+def _binned_accuracy(df, bin_col="bin_mid", species_weighted=False):
+    """Mean accuracy per depth bin, optionally weighting species equally."""
+    if not species_weighted:
+        return df.groupby(bin_col)["correct"].mean()
+    per = df.groupby([bin_col, "species"])["correct"].mean()
+    return per.groupby(bin_col).mean()
 
-    Helps separate distribution shift from intrinsic difficulty.
+
+def plot_accuracy_vs_depth(predictions, depth_df, depth_threshold=None,
+                           n_bins=15, int_preds=None, int_modes=None,
+                           species_weighted=False, save_path=None):
+    """Line graph of accuracy vs depth for each model.
+
+    Args:
+        predictions: DataFrame from evaluation.save_results with columns
+            model, split, image_id, correct.
+        depth_df: DataFrame with columns image_id, depth_m.
+        depth_threshold: If given, draw a vertical line at this depth
+            (the shallow/deep training cutoff) for the shallow model.
+        n_bins: Number of equal-frequency depth bins.
+        int_preds: Optional intervention predictions DataFrame with columns
+            model, split, mode, image_id, correct.
+        int_modes: List of intervention modes to overlay, e.g.
+            ['grey_bg', 'blur_bg'].  Accepts a single string too.
+        species_weighted: If True, compute per-species accuracy within each
+            depth bin first, then average across species so every species
+            counts equally regardless of image count.
+        save_path: If provided, save the figure to this path.
     """
-    raise NotImplementedError
+    df = predictions.merge(depth_df[["image_id", "depth_m"]], on="image_id", how="left")
+    df = df.dropna(subset=["depth_m"])
+
+    df["depth_bin"] = pd.qcut(df["depth_m"], n_bins, duplicates="drop")
+    df["bin_mid"] = df["depth_bin"].apply(lambda b: b.mid)
+
+    colors = {"shallow": MARK_COLOR, "control": "#eb6834"}
+    fig, ax = plt.subplots(figsize=(3.4, 2.8))
+
+    for model in df["model"].unique():
+        sub = df[df["model"] == model]
+        acc = _binned_accuracy(sub, species_weighted=species_weighted)
+        ax.plot(acc.index, acc.values, marker="o", markersize=3,
+                linewidth=1.2, label=model.capitalize(),
+                color=colors.get(model, INK_MUTED))
+
+    if int_preds is not None and int_modes is not None:
+        if isinstance(int_modes, str):
+            int_modes = [int_modes]
+        mode_style = {
+            "grey_bg": ("Bg removed", "#8b5cf6", "s"),
+            "blur_bg": ("Bg blurred", "#eb6834", "^"),
+        }
+        for mode in int_modes:
+            label, color, marker = mode_style.get(mode, (mode, INK_MUTED, "D"))
+            ip = int_preds[(int_preds["model"] == "shallow")
+                           & (int_preds["mode"] == mode)]
+            ip = ip.merge(depth_df[["image_id", "depth_m"]],
+                          on="image_id", how="left")
+            ip = ip.dropna(subset=["depth_m"])
+            ip["depth_bin"] = pd.cut(ip["depth_m"],
+                                     bins=df["depth_bin"].cat.categories)
+            ip["bin_mid"] = ip["depth_bin"].apply(lambda b: b.mid)
+            acc_int = _binned_accuracy(ip, species_weighted=species_weighted)
+            ax.plot(acc_int.index, acc_int.values, marker=marker,
+                    markersize=3, linewidth=1.2, linestyle="--",
+                    label=f"Shallow ({label})", color=color)
+
+    if depth_threshold is not None:
+        ax.axvline(depth_threshold, color=INK_MUTED, linestyle="--",
+                   linewidth=0.8, label=f"Depth threshold ({depth_threshold} m)")
+
+    ax.set_xlabel("Depth (m)", fontsize=8)
+    ax.set_ylabel("Accuracy", fontsize=8)
+    title = "Accuracy vs depth"
+    if species_weighted:
+        title += " (species-weighted)"
+    ax.set_title(title, fontsize=8, pad=6)
+    ax.legend(fontsize=7, frameon=False)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.tick_params(labelsize=7)
+    ax.grid(alpha=0.25)
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=300)
+    plt.show()
+    return fig
 
 
 def generate_summary_table(crs_scores, degradation_scores, rho, p_value,
