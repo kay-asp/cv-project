@@ -455,11 +455,14 @@ class CropDataset(Dataset):
         return self.transform(img), self.labels[i]
 
 
-def _mask_file(image_id, ann_id):
-    return f"{image_id}_{ann_id}.png"
+MASK_MODES = {"target": "", "same_species": "_species", "all": "_all"}   # mode -> cache file suffix
 
 
-def get_crop_mask(coco, image_id, ann_id, bbox):
+def _mask_file(image_id, ann_id, mask_mode="target"):
+    return f"{image_id}_{ann_id}{MASK_MODES[mask_mode]}.png"
+
+
+def get_crop_mask(coco, image_id, ann_id, bbox, mask_mode="target"):
     """Organism mask aligned pixel-for-pixel with the saved crop.
 
     Same steps as the notebook's crop check (annToMask -> crop_to_bounding_box),
@@ -470,15 +473,29 @@ def get_crop_mask(coco, image_id, ann_id, bbox):
     Cached: the first call saves the mask to MASK_DIR as a PNG, later calls
     just load it.
 
+    Args:
+        mask_mode: Which annotations on the image count as organism (each
+            cropped to this crop, and cached under its own file name):
+            'target' - only this annotation;
+            'same_species' - every annotation of this annotation's category,
+                so other individuals of the species aren't background;
+            'all' - every annotation, whatever its category.
+
     Returns:
         uint8 array of shape IMG_SIZE (H, W), 1 = organism.
     """
-    path = os.path.join(config.MASK_DIR, _mask_file(image_id, ann_id))
+    if mask_mode not in MASK_MODES:
+        raise ValueError(f"mask_mode must be one of {list(MASK_MODES)}, got {mask_mode!r}")
+    path = os.path.join(config.MASK_DIR, _mask_file(image_id, ann_id, mask_mode))
     if os.path.exists(path):
         return np.array(Image.open(path), dtype=np.uint8)
 
     ann = coco.loadAnns([int(ann_id)])[0]
     full_mask = coco.annToMask(ann)
+    if mask_mode != "target":
+        for other in coco.loadAnns(coco.getAnnIds(imgIds=[ann["image_id"]])):
+            if mask_mode == "all" or other["category_id"] == ann["category_id"]:
+                full_mask |= coco.annToMask(other)
     h, w = full_mask.shape
     _, mask, _ = crop_to_bounding_box(Image.new("L", (w, h)), bbox, mask=full_mask)
     # Same resize call as save_crop; NEAREST keeps the mask binary
@@ -504,25 +521,33 @@ def prepare_masks(mask_loader):
     existing = set(os.listdir(config.MASK_DIR)) if os.path.isdir(config.MASK_DIR) else set()
     n_new = 0
     for image_id, ann_id, bbox in zip(ds.image_ids, ds.ann_ids, ds.bboxes):
-        if _mask_file(image_id, ann_id) not in existing:
-            get_crop_mask(ds.coco, image_id, ann_id, bbox)
+        if _mask_file(image_id, ann_id, ds.mask_mode) not in existing:
+            get_crop_mask(ds.coco, image_id, ann_id, bbox, ds.mask_mode)
             n_new += 1
     print(f"Masks: {n_new} newly saved, {len(ds) - n_new} already cached in {config.MASK_DIR}")
     return n_new
 
 
 class MaskedCropDataset(CropDataset):
-    """CropDataset that also yields each crop's organism mask (for CRS)."""
+    """CropDataset that also yields each crop's organism mask (for CRS).
 
-    def __init__(self, df, species_to_idx, crop_dir, transform, coco):
+    mask_mode: which annotations count as organism (see get_crop_mask).
+    """
+
+    def __init__(self, df, species_to_idx, crop_dir, transform, coco, mask_mode="target"):
         super().__init__(df, species_to_idx, crop_dir, transform)
         self.bboxes = df["bbox"].tolist()
         self.coco = coco
+        self.mask_mode = mask_mode
+
+    def get_mask(self, i):
+        """Mask of crop i as a uint8 numpy array (without loading the image)."""
+        return get_crop_mask(self.coco, self.image_ids[i], self.ann_ids[i], self.bboxes[i],
+                             self.mask_mode)
 
     def __getitem__(self, i):
         img, label = super().__getitem__(i)
-        mask = get_crop_mask(self.coco, self.image_ids[i], self.ann_ids[i], self.bboxes[i])
-        return img, label, torch.from_numpy(mask)
+        return img, label, torch.from_numpy(self.get_mask(i))
 
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -564,8 +589,17 @@ def _build_transform(train):
                                transforms.ToTensor(), norm])
 
 
+def seed_worker(worker_id):
+    """Seed NumPy and Python RNGs in each DataLoader worker."""
+
+    import random
+
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+    
 def get_dataloaders(metadata_df, split="train", batch_size=None,
-                    species_list=None, coco=None):
+                    species_list=None, coco=None, mask_mode="target"):
     """Build PyTorch DataLoaders with standard augmentation / normalisation.
 
     Args:
@@ -578,6 +612,8 @@ def get_dataloaders(metadata_df, split="train", batch_size=None,
         coco: COCO object; if given, batches also include crop-aligned masks
             (for attribution). Not allowed with split='train', whose random
             flip would misalign image and mask.
+        mask_mode: With coco, which annotations count as organism in the
+            masks: 'target' (default), 'same_species' or 'all' (see get_crop_mask).
 
     Returns:
         DataLoader yielding (images, labels), or (images, labels, masks) when
@@ -587,6 +623,8 @@ def get_dataloaders(metadata_df, split="train", batch_size=None,
         raise ValueError(f"split must be train/val/test/all, got {split!r}")
     if coco is not None and split == "train":
         raise ValueError("masks are only supported for val/test/all (train augmentation flips images)")
+    if mask_mode != "target" and coco is None:
+        raise ValueError("mask_mode needs coco (it only changes the masks)")
     crop_dir = config.CROP_DIR
     species_list = list(species_list) if species_list is not None else sorted(metadata_df["species"].unique())
     species_to_idx = {s: i for i, s in enumerate(species_list)}
@@ -613,13 +651,40 @@ def get_dataloaders(metadata_df, split="train", batch_size=None,
 
     transform = _build_transform(train=(split == "train"))
     if coco is not None:
-        ds = MaskedCropDataset(df, species_to_idx, crop_dir, transform, coco)
+        ds = MaskedCropDataset(df, species_to_idx, crop_dir, transform, coco, mask_mode)
     else:
         ds = CropDataset(df, species_to_idx, crop_dir, transform)
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=(split == "train"),
-                        num_workers=config.NUM_WORKERS or os.cpu_count(),
-                        persistent_workers=True, prefetch_factor=4,
-                        pin_memory=torch.cuda.is_available())
+    #loader = DataLoader(ds, batch_size=batch_size, shuffle=(split == "train"),
+    #                    num_workers=config.NUM_WORKERS or os.cpu_count(),
+    #                    persistent_workers=True, prefetch_factor=4,
+    #                    pin_memory=torch.cuda.is_available())
+    ##loader.species_list = species_list
+    #print(f"{split}: {len(ds)} crops, {len(species_list)} classes")
+    #return loader
+    
+    # Reproducible DataLoader randomness
+    # controls the random shuffling of the training dataset, while seed_worker() initializes randomness in the dataloader workers.
+    generator = torch.Generator()
+    generator.manual_seed(config.RANDOM_SEED)
+
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=(split == "train"),
+        num_workers=config.NUM_WORKERS or os.cpu_count(),
+        persistent_workers=True,
+        prefetch_factor=4,
+        pin_memory=torch.cuda.is_available(),
+        worker_init_fn=seed_worker,
+        generator=generator,
+    )
+
     loader.species_list = species_list
     print(f"{split}: {len(ds)} crops, {len(species_list)} classes")
     return loader
+# ensures each worker receives a reproducible random seed
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    import random
+    random.seed(worker_seed)

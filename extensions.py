@@ -20,13 +20,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from scipy.stats import mannwhitneyu, spearmanr, wilcoxon
 from torchvision.transforms.functional import gaussian_blur
 
 import config
 import data
-from attribution import _gradcam_batch
+from attribution import compute_crs, compute_gradcam, compute_image_crs, dilate_masks   # compute_image_crs re-exported for the notebooks
 
 MODES = ("none", "grey_bg", "blur_bg", "grey_organism")
 MODE_LABELS = {"none": "Original", "grey_bg": "Background greyed",
@@ -46,19 +45,6 @@ def _save(fig, save_path):
 
 
 # ── 1. Background intervention ───────────────────────────────────────
-
-def dilate_masks(masks, px):
-    """Grow each organism mask by px pixels (so its edges aren't cut off).
-
-    Args:
-        masks: (B, H, W) tensor, 1 = organism.
-        px: pixels to grow by; 0 returns the masks unchanged (as float).
-    """
-    masks = masks.float()
-    if px <= 0:
-        return masks
-    return F.max_pool2d(masks[:, None], kernel_size=2 * px + 1, stride=1, padding=px)[:, 0]
-
 
 def apply_intervention(images, masks, mode, dilate_px=3, blur_sigma=10.0):
     """Edit a batch of normalised crops.
@@ -196,8 +182,9 @@ def intervention_summary(preds, species=None, modes=MODES):
 def background_dependence(preds, crs_scores, model="shallow", species=None):
     """Does removing the background hurt the species Grad-CAM says rely on it?
 
-    Per species: drop = accuracy(original) - accuracy(background greyed), on
-    shallow test crops. If CRS measures real reliance, high-CRS species should
+    Per species: drop = 1 - accuracy(background greyed) / accuracy(original),
+    the share of accuracy lost, on shallow test crops (NaN when the original
+    accuracy is 0). If CRS measures real reliance, high-CRS species should
     show bigger drops (positive Spearman rho). Also reported for blur.
 
     Returns:
@@ -208,7 +195,8 @@ def background_dependence(preds, crs_scores, model="shallow", species=None):
     stats = {}
     for mode in ("grey_bg", "blur_bg"):
         col = f"drop_{mode}"
-        df[col] = wide[f"{model}_shallow_none"] - wide[f"{model}_shallow_{mode}"]
+        orig = wide[f"{model}_shallow_none"]
+        df[col] = 1 - wide[f"{model}_shallow_{mode}"] / orig.where(orig > 0)   # share of accuracy lost
         ok = df[["crs", col]].dropna()
         rho, p = spearmanr(ok["crs"], ok[col])
         stats[mode] = (float(rho), float(p), len(ok))
@@ -390,10 +378,10 @@ def species_shift(shallow_stats, deep_stats):
     return out
 
 
-def shift_analysis(per_species_df, species=None):
+def shift_analysis(per_species_df, species=None, crs_col="shallow_crs"):
     """Does background shift predict degradation, alone and combined with CRS?
 
-    Needs per_species_df columns: degradation, crs, bg_colour_shift,
+    Needs per_species_df columns: degradation, crs_col, bg_colour_shift,
     org_colour_shift.
 
     Reports:
@@ -411,6 +399,7 @@ def shift_analysis(per_species_df, species=None):
     import statsmodels.formula.api as smf
 
     df = per_species_df if species is None else per_species_df.reindex(species)
+    df = df.rename(columns={crs_col: "crs"})
     df = df[["degradation", "crs", "bg_colour_shift", "org_colour_shift"]].dropna()
     print(f"Shift analysis over {len(df)} species")
 
@@ -437,43 +426,6 @@ def shift_analysis(per_species_df, species=None):
 
 # ── 3. Per-image CRS: correct vs incorrect ───────────────────────────
 
-def compute_image_crs(model, mask_loader, target_layer=config.GRADCAM_TARGET_LAYER):
-    """Grad-CAM CRS for every crop, plus whether the model got it right.
-
-    Explained for the true species (same as compute_species_crs), so a wrong
-    prediction's CRS says how much of the evidence for the right species
-    came from background.
-
-    Returns:
-        DataFrame, one row per crop: image_id, ann_id, species, pred, correct, crs.
-    """
-    device = _device()
-    model = model.to(device).eval()
-    labels_all, preds_all, crs_all = [], [], []
-    for images, labels, masks in mask_loader:
-        images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
-        labels = labels.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
-        with torch.no_grad(), torch.autocast(device.type, dtype=torch.float16,
-                                             enabled=device.type == "cuda"):
-            preds = model(images).argmax(dim=1)
-        cams = _gradcam_batch(model, images, labels, target_layer)
-        total = cams.sum(dim=(1, 2))
-        outside = (cams * (masks == 0)).sum(dim=(1, 2))
-        crs = torch.where(total > 0, outside / total.clamp_min(1e-12),
-                          torch.full_like(total, float("nan")))
-        labels_all.append(labels.cpu())
-        preds_all.append(preds.cpu())
-        crs_all.append(crs.float().cpu())
-
-    ds, sl = mask_loader.dataset, mask_loader.species_list
-    labels, preds = torch.cat(labels_all).tolist(), torch.cat(preds_all).tolist()
-    return pd.DataFrame({"image_id": ds.image_ids, "ann_id": ds.ann_ids,
-                         "species": [sl[i] for i in labels], "pred": [sl[i] for i in preds],
-                         "correct": [a == b for a, b in zip(labels, preds)],
-                         "crs": torch.cat(crs_all).double().numpy()})
-
-
 def crs_correct_vs_incorrect(image_crs, species=None, min_each=3, label=""):
     """Is CRS higher on wrong predictions than right ones?
 
@@ -484,12 +436,19 @@ def crs_correct_vs_incorrect(image_crs, species=None, min_each=3, label=""):
         correct AND >= min_each incorrect crops, mean CRS(incorrect) minus
         mean CRS(correct). Wilcoxon signed-rank test on those differences.
 
+    Crops with an empty Grad-CAM map have no CRS and are left out; their
+    counts (n_empty_correct / n_empty_incorrect) are reported so a skew
+    towards wrong crops is visible.
+
     Returns:
         dict of results; also prints a short summary.
     """
-    df = image_crs.dropna(subset=["crs"])
+    df = image_crs
     if species is not None:
         df = df[df["species"].isin(species)]
+    empty = df["crs"].isna()
+    n_empty_right, n_empty_wrong = int((empty & df["correct"]).sum()), int((empty & ~df["correct"]).sum())
+    df = df[~empty]
     right, wrong = df.loc[df["correct"], "crs"], df.loc[~df["correct"], "crs"]
     _, p_pooled = mannwhitneyu(wrong, right, alternative="two-sided")
 
@@ -500,13 +459,14 @@ def crs_correct_vs_incorrect(image_crs, species=None, min_each=3, label=""):
 
     res = {"split": label, "n_correct": len(right), "n_incorrect": len(wrong),
            "median_crs_correct": right.median(), "median_crs_incorrect": wrong.median(),
+           "n_empty_correct": n_empty_right, "n_empty_incorrect": n_empty_wrong,
            "p_pooled": p_pooled, "n_species_within": len(diffs),
            "median_within_species_diff": diffs.median() if len(diffs) else float("nan"),
            "p_within": p_within}
     print(f"[{label}] median CRS correct {res['median_crs_correct']:.3f} vs incorrect "
           f"{res['median_crs_incorrect']:.3f} (pooled p = {p_pooled:.3g}); within "
           f"{len(diffs)} species, median diff = {res['median_within_species_diff']:.3f} "
-          f"(p = {p_within:.3g})")
+          f"(p = {p_within:.3g}); empty maps left out: {n_empty_right} correct, {n_empty_wrong} wrong")
     return res
 
 
@@ -542,6 +502,57 @@ def plot_crs_correct_vs_incorrect(image_crs_by_split, species=None, save_path=No
     ax.spines[["top", "right"]].set_visible(False)
     ax.tick_params(labelsize=7)
     ax.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    _save(fig, save_path)
+    plt.show()
+    return fig
+
+
+def plot_attribution_grid(models, mask_loaders, species, seed=config.RANDOM_SEED, save_path=None):
+    """Grad-CAM overlays for every (model, split) pair on the same crops of each species.
+
+    One row per species. Each species gets one shallow and one deep test crop,
+    picked at random (seeded) and shown to every model, so columns differ only
+    in the model or the depth. Maps explain the true species; each panel gives
+    its CRS. One crop per cell is illustrative only: the CRS-vs-depth plot is
+    the quantitative version.
+
+    Args:
+        models: dict name -> model, e.g. {'shallow': classifier, 'control': control}.
+        mask_loaders: dict split -> loader from data.get_dataloaders(..., coco=coco).
+        species: species names, one row each.
+    """
+    rng = np.random.default_rng(seed)
+    mean = torch.tensor(data.IMAGENET_MEAN).view(3, 1, 1)
+    std = torch.tensor(data.IMAGENET_STD).view(3, 1, 1)
+    cols = [(m, s) for m in models for s in mask_loaders]
+    fig, axes = plt.subplots(len(species), len(cols), squeeze=False,
+                             figsize=(2.2 * len(cols), 2.2 * len(species)))
+    for r, sp in enumerate(species):
+        crops = {}
+        for split, loader in mask_loaders.items():
+            ds = loader.dataset
+            idx = np.flatnonzero(np.array(ds.labels) == loader.species_list.index(sp))
+            crops[split] = ds[int(rng.choice(idx))] if len(idx) else None
+        for c, (name, split) in enumerate(cols):
+            ax = axes[r, c]
+            ax.axis("off")
+            if r == 0:
+                ax.set_title(f"{name} model\n{split} crop", fontsize=8)
+            if c == 0:
+                ax.text(-0.06, 0.5, sp, transform=ax.transAxes, rotation=90,
+                        ha="right", va="center", fontsize=8)
+            if crops[split] is None:
+                continue
+            img, label, mask = crops[split]
+            model = models[name]
+            heatmap = compute_gradcam(model, img, label)   # normalised, for display
+            crs = compute_crs(compute_gradcam(model, img, label, raw=True), mask)
+            ax.imshow((img * std + mean).clamp(0, 1).permute(1, 2, 0).numpy())
+            ax.imshow(heatmap, cmap="jet", alpha=0.5, vmin=0, vmax=1)
+            ax.contour(mask.numpy(), levels=[0.5], colors="white", linewidths=1)
+            ax.text(4, 14, f"CRS {crs:.2f}", color="white", fontsize=7,
+                    bbox=dict(facecolor="black", alpha=0.5, pad=1, linewidth=0))
     plt.tight_layout()
     _save(fig, save_path)
     plt.show()
@@ -625,61 +636,92 @@ def plot_crs_variance_vs_degradation(var_df, metric="std", rho=None, p_value=Non
 
 # ── 5. CRS adjusted for mask size ────────────────────────────────────
 
-def crs_mask_size_analysis(crs_scores, uniform_crs, degradation_scores,
-                           species=None):
-    """Test whether CRS is driven by mask size and re-test after normalising.
+def _partial_spearman(x, y, z):
+    """Spearman correlation of x and y controlling for z (all pd.Series).
 
-    The uniform-random CRS for a species equals (1 − mean mask coverage),
-    so normalised CRS = raw CRS / uniform CRS scales out the geometric
-    effect of mask size.  A value of 1 means the model is no more
-    context-reliant than a random attribution map; above 1 means genuinely
-    reliant on background.
+    Ranks all three, removes the linear effect of z's ranks from x's and y's,
+    and correlates the residuals; the p-value uses n - 3 degrees of freedom.
+    """
+    from scipy.stats import t as t_dist
+
+    rx, ry, rz = x.rank(), y.rank(), z.rank()
+    design = np.column_stack([np.ones(len(rz)), rz])
+    res_x = rx - design @ np.linalg.lstsq(design, rx, rcond=None)[0]
+    res_y = ry - design @ np.linalg.lstsq(design, ry, rcond=None)[0]
+    r = float(np.corrcoef(res_x, res_y)[0, 1])
+    dof = len(x) - 3
+    p = float(2 * t_dist.sf(abs(r) * np.sqrt(dof / max(1e-12, 1 - r ** 2)), dof))
+    return r, p
+
+
+def crs_mask_size_analysis(per_species_df, species=None, prefix="shallow_"):
+    """Test whether CRS is driven by mask size, and re-test with it removed.
+
+    Each crop's chance CRS (what a flat heatmap scores on its mask) is
+    1 - organism coverage, so small organisms get a high CRS for free. Three
+    ways to take that out, all from compute_species_crs columns:
+      - crs_excess: mean per-image (CRS - chance). 0 = no more context than
+        a flat map, > 0 = more. (Bounded above by coverage, so very small
+        organisms can't score highly; the covariate checks don't have this.)
+      - partial Spearman of CRS vs degradation, controlling for coverage.
+      - OLS: degradation ~ crs + mask_coverage (both standardised).
 
     Args:
-        crs_scores: dict species -> Grad-CAM CRS.
-        uniform_crs: dict species -> uniform-baseline CRS (= 1 − coverage).
-        degradation_scores: dict species -> degradation.
+        per_species_df: results table with columns {prefix}crs,
+            {prefix}crs_chance, {prefix}crs_excess and degradation, indexed by
+            species.
         species: optional list to restrict to.
+        prefix: which split's CRS columns to use ('shallow_' or 'deep_').
 
     Returns:
-        (per-species DataFrame, dict metric -> (rho, p, n))
+        (per-species DataFrame with unprefixed crs, crs_chance, crs_excess,
+        degradation and mask_coverage columns, dict metric -> (rho, p, n),
+        fitted OLS result)
     """
-    names = species if species is not None else sorted(
-        set(crs_scores) & set(uniform_crs) & set(degradation_scores))
-    df = pd.DataFrame({
-        "crs": {s: crs_scores.get(s) for s in names},
-        "uniform_crs": {s: uniform_crs.get(s) for s in names},
-        "degradation": {s: degradation_scores.get(s) for s in names},
-    }).dropna()
-    df["mask_coverage"] = 1 - df["uniform_crs"]
-    df["normalised_crs"] = df["crs"] / df["uniform_crs"].clip(lower=1e-6)
+    import statsmodels.formula.api as smf
+
+    df = per_species_df
+    if species is not None:
+        df = df.reindex(species)
+    cols = {f"{prefix}{c}": c for c in ("crs", "crs_chance", "crs_excess")}
+    df = df[[*cols, "degradation"]].rename(columns=cols).dropna().copy()
+    df["mask_coverage"] = 1 - df["crs_chance"]
+    n = len(df)
 
     results = {}
-    rho, p = spearmanr(df["mask_coverage"], df["crs"])
-    results["coverage_vs_crs"] = (float(rho), float(p), len(df))
-    print(f"Mask coverage vs CRS: ρ = {rho:.3f}, p = {p:.3g}, n = {len(df)}")
+    for key, label, (a, b) in [
+            ("coverage_vs_crs", "Mask coverage vs CRS", ("mask_coverage", "crs")),
+            ("raw_crs_vs_degradation", "Raw CRS vs degradation", ("crs", "degradation")),
+            ("excess_crs_vs_degradation", "Excess CRS vs degradation", ("crs_excess", "degradation"))]:
+        rho, p = spearmanr(df[a], df[b])
+        results[key] = (float(rho), float(p), n)
+        print(f"{label}: ρ = {rho:.3f}, p = {p:.3g}, n = {n}")
 
-    rho, p = spearmanr(df["crs"], df["degradation"])
-    results["raw_crs_vs_degradation"] = (float(rho), float(p), len(df))
-    print(f"Raw CRS vs degradation: ρ = {rho:.3f}, p = {p:.3g}, n = {len(df)}")
+    rho, p = _partial_spearman(df["crs"], df["degradation"], df["mask_coverage"])
+    results["partial_crs_vs_degradation"] = (rho, p, n)
+    print(f"CRS vs degradation, controlling for coverage: partial ρ = {rho:.3f}, p = {p:.3g}, n = {n}")
 
-    rho, p = spearmanr(df["normalised_crs"], df["degradation"])
-    results["normalised_crs_vs_degradation"] = (float(rho), float(p), len(df))
-    print(f"Normalised CRS vs degradation: ρ = {rho:.3f}, p = {p:.3g}, n = {len(df)}")
+    z = lambda c: (df[c] - df[c].mean()) / df[c].std()
+    reg_df = pd.DataFrame({"degradation": df["degradation"], "crs": z("crs"),
+                           "mask_coverage": z("mask_coverage")})
+    fit = smf.ols("degradation ~ crs + mask_coverage", data=reg_df).fit()
+    print(f"OLS degradation ~ crs + coverage: crs coef = {fit.params['crs']:.3f} "
+          f"(p = {fit.pvalues['crs']:.3g}), coverage coef = {fit.params['mask_coverage']:.3f} "
+          f"(p = {fit.pvalues['mask_coverage']:.3g})")
 
-    return df, results
+    return df, results, fit
 
 
-def plot_normalised_crs_vs_degradation(adj_df, rho=None, p_value=None,
-                                       n_labels=5, save_path=None):
-    """Scatter: mask-size-normalised CRS vs degradation."""
-    x, y = adj_df["normalised_crs"], adj_df["degradation"]
+def plot_excess_crs_vs_degradation(adj_df, rho=None, p_value=None,
+                                   n_labels=5, save_path=None):
+    """Scatter: mask-size-adjusted (excess) CRS vs degradation."""
+    x, y = adj_df["crs_excess"], adj_df["degradation"]
     ok = x.notna() & y.notna()
     x, y = x[ok], y[ok]
 
     fig, ax = plt.subplots(figsize=(3.4, 2.8))
     ax.axhline(0, color="#bbbbbb", linewidth=0.8, zorder=0)
-    ax.axvline(1, color="#bbbbbb", linewidth=0.8, linestyle="--", zorder=0)
+    ax.axvline(0, color="#bbbbbb", linewidth=0.8, linestyle="--", zorder=0)
     ax.scatter(x, y, s=12, color=SPLIT_COLORS["shallow"], alpha=0.7,
                edgecolor="white", linewidth=0.4)
 
@@ -688,11 +730,11 @@ def plot_normalised_crs_vs_degradation(adj_df, rho=None, p_value=None,
         ax.annotate(s, (x[s], y[s]), xytext=(5, 5), textcoords="offset points",
                     fontsize=6, color=INK_MUTED)
 
-    title = "Normalised CRS vs depth degradation"
+    title = "Excess CRS vs depth degradation"
     if rho is not None:
         title += f"\nρ = {rho:.3f}, p = {p_value:.3g}, n = {len(x)}"
     ax.set_title(title, fontsize=8, pad=6)
-    ax.set_xlabel("Normalised CRS (observed / expected)", fontsize=8)
+    ax.set_xlabel("Excess CRS (observed − chance)", fontsize=8)
     ax.set_ylabel("Degradation", fontsize=8)
     ax.spines[["top", "right"]].set_visible(False)
     ax.tick_params(labelsize=7)
@@ -711,8 +753,9 @@ def degradation_context_analysis(preds, degradation_scores, species=None,
     background in shallow water?
 
     Per species, computes:
-      - bg_reliance: shallow accuracy drop when background is removed
-        (higher = the model leaned on background more in shallow water).
+      - bg_reliance: share of shallow accuracy lost when background is removed,
+        1 - edited / original (higher = the model leaned on background more in
+        shallow water; NaN when the original accuracy is 0).
       - reduction: how much removing background shrinks the shallow-to-deep
         gap (higher = background cues explained more of the degradation).
 
@@ -742,7 +785,10 @@ def degradation_context_analysis(preds, degradation_scores, species=None,
     df = df.reindex(deg.index).dropna()
 
     df["degradation"] = deg
-    df["bg_reliance"] = df[sh_orig] - df[sh_edit]
+    # Share of the original shallow accuracy lost when the background is edited
+    # (0 = background not used, 1 = everything lost, < 0 = the edit helped).
+    # Undefined when the original accuracy is 0, so those species drop out of this metric
+    df["bg_reliance"] = 1 - df[sh_edit] / df[sh_orig].where(df[sh_orig] > 0)
     df["degradation_original"] = df[sh_orig] - df[dp_orig]
     df["degradation_edited"] = df[sh_edit] - df[dp_edit]
     df["reduction"] = df["degradation_original"] - df["degradation_edited"]
@@ -750,11 +796,42 @@ def degradation_context_analysis(preds, degradation_scores, species=None,
     results = {}
     for metric, label in (("bg_reliance", "Background reliance vs degradation"),
                           ("reduction", "Degradation reduction vs degradation")):
-        rho, p = spearmanr(df[metric], df["degradation"])
-        results[metric] = (float(rho), float(p), len(df))
-        print(f"{label}: ρ = {rho:.3f}, p = {p:.3g}, n = {len(df)}")
+        ok = df[[metric, "degradation"]].dropna()
+        rho, p = spearmanr(ok[metric], ok["degradation"])
+        results[metric] = (float(rho), float(p), len(ok))
+        print(f"{label}: ρ = {rho:.3f}, p = {p:.3g}, n = {len(ok)}")
 
     return df, results
+
+
+def high_degradation_test(per_species_df, species=None, quantile=0.75, deg_col="degradation",
+                          cols=("shallow_crs", "shallow_crs_excess", "shallow_crs_pred_excess",
+                                "bg_reliance", "shallow_acc")):
+    """Do the most-degrading species rely on background more than the rest?
+
+    Species at or above the given degradation quantile vs everyone else, compared
+    on each column with a two-sided Mann-Whitney U test. This targets the case the
+    overall Spearman can miss: background reliance driving degradation in only
+    some species. shallow_acc is a check, not a hypothesis: a species can only
+    degrade as far as its shallow accuracy, so the high group is also the
+    better-learned group, and anything that tracks accuracy differs too.
+
+    Returns:
+        DataFrame indexed by column: high_mean, rest_mean, diff, p, n_high, n_rest.
+    """
+    df = per_species_df if species is None else per_species_df.reindex(species)
+    df = df.dropna(subset=[deg_col])
+    cut = df[deg_col].quantile(quantile)
+    high = df[deg_col] >= cut
+    print(f"High {deg_col}: >= {cut:.3f} ({int(high.sum())} of {len(df)} species)")
+    rows = {}
+    for c in cols:
+        if c not in df:
+            continue
+        a, b = df.loc[high, c].dropna(), df.loc[~high, c].dropna()
+        rows[c] = {"high_mean": a.mean(), "rest_mean": b.mean(), "diff": a.mean() - b.mean(),
+                   "p": float(mannwhitneyu(a, b).pvalue), "n_high": len(a), "n_rest": len(b)}
+    return pd.DataFrame(rows).T
 
 
 def _bin_degradation(df, n_bins, orig_col="degradation_original",
@@ -849,6 +926,268 @@ def plot_degradation_bar(df, mode_label="background removed",
     ax.tick_params(labelsize=7)
     ax.axhline(0, color="#bbbbbb", linewidth=0.8, zorder=0)
     ax.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    _save(fig, save_path)
+    plt.show()
+    return fig
+
+# ── 4. Background swap ───────────────────────────────────────────────
+
+SWAP_MODES = ("none", "swap_same", "swap_other")
+SWAP_LABELS = {"none": "Original", "swap_same": "Same-depth background",
+               "swap_other": "Other-depth background"}
+
+
+def clean_background(images, masks, dilate_px=3, fill_sigma=20.0):
+    """Remove the organism from a batch of crops, leaving only background.
+
+    The organism (mask grown by dilate_px, so its edges go too) is filled in
+    with a heavy blur of the surrounding background, computed from background
+    pixels only (same normalised convolution as blur_bg).
+
+    Args:
+        images: (B, 3, H, W) normalised tensor.
+        masks: (B, H, W) tensor, 1 = organism.
+    """
+    hole = dilate_masks(masks, dilate_px)[:, None].to(images.dtype)       # (B, 1, H, W)
+    bg = 1 - hole
+    k = int(4 * fill_sigma) | 1                                           # odd kernel size
+    num = gaussian_blur(images * bg, [k, k], [fill_sigma, fill_sigma])
+    den = gaussian_blur(bg, [k, k], [fill_sigma, fill_sigma])
+    fill = num / den.clamp_min(1e-6)
+    return images * bg + fill * hole
+
+
+def build_background_bank(mask_loader, n=1000, n_bins=5, seed=config.RANDOM_SEED,
+                          dilate_px=3):
+    """Organism-free backgrounds from a random sample of one split's crops.
+
+    Donors are later matched to crops by organism size (coverage bins), so a
+    small organism is never pasted onto a background with a large blurred hole.
+
+    Returns:
+        dict with 'images' (n, 3, H, W) float16 on CPU, 'coverage' (share of
+        each donor crop covered by its organism), 'bin', 'edges', 'labels' and
+        'image_ids'.
+    """
+    ds = mask_loader.dataset
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(ds), size=min(n, len(ds)), replace=False)
+    images, coverage, labels = [], [], []
+    for i in idx:
+        img, label, mask = ds[int(i)]
+        images.append(clean_background(img[None], mask[None], dilate_px)[0].half())
+        coverage.append(float(mask.float().mean()))
+        labels.append(int(label))
+    coverage = np.array(coverage)
+    edges = np.quantile(coverage, np.linspace(0, 1, n_bins + 1)[1:-1])
+    print(f"Background bank: {len(idx)} donors from {len(ds)} crops")
+    return {"images": torch.stack(images), "coverage": coverage,
+            "bin": np.digitize(coverage, edges), "edges": edges,
+            "labels": np.array(labels),
+            "image_ids": np.array([ds.image_ids[i] for i in idx])}
+
+
+def _pick_donors(bank, coverage, labels, image_ids, rng):
+    """One donor per crop: a background of similar organism size, from a
+    different species and a different image, so neither the label nor the
+    crop's own scene can leak back in."""
+    out = np.empty(len(coverage), dtype=int)
+    for j, (c, lab, img) in enumerate(zip(coverage, labels, image_ids)):
+        ok = (bank["labels"] != lab) & (bank["image_ids"] != img)
+        same_bin = ok & (bank["bin"] == np.digitize(c, bank["edges"]))
+        out[j] = rng.choice(np.flatnonzero(same_bin if same_bin.any() else ok))
+    return out
+
+
+def run_background_swap(models, loaders, banks, species_list, seed=config.RANDOM_SEED):
+    """Predict every test crop with its background replaced by one from the
+    same depth and by one from the other depth.
+
+    The crop's organism (exact mask, as in grey_bg) is pasted onto an
+    organism-free background from the banks. 'swap_same' takes the background
+    from the crop's own split and 'swap_other' from the other split. Both are
+    composites made the same way, so comparing them isolates the depth of the
+    background from any damage caused by compositing itself. Every model sees
+    the same composite for a given crop and mode.
+
+    Args:
+        models: dict name -> model, e.g. {'shallow': classifier, 'control': control}.
+        loaders: dict split -> mask loader, {'shallow': ..., 'deep': ...}.
+        banks: dict split -> build_background_bank output, same keys.
+        species_list: class order.
+
+    Returns:
+        DataFrame like run_interventions, one row per (model, split, mode,
+        crop), plus bg_split (depth of the background) and donor_image_id.
+    """
+    device = _device()
+    for m in models.values():
+        m.to(device).eval()
+    rng = np.random.default_rng(seed)
+
+    out = []
+    for split, loader in loaders.items():
+        ds = loader.dataset
+        other = next(s for s in loaders if s != split)
+        bg_of = {"none": split, "swap_same": split, "swap_other": other}
+        rec = {(name, mode): ([], [], [], []) for name in models for mode in SWAP_MODES}
+        start = 0
+        for images, labels, masks in loader:
+            ids = np.array(ds.image_ids[start:start + len(labels)])
+            start += len(labels)
+            coverage = masks.float().mean(dim=(1, 2)).numpy()
+            images = images.to(device, non_blocking=True)
+            organism = masks.to(device, non_blocking=True).float()[:, None].to(images.dtype)
+            for mode in SWAP_MODES:
+                if mode == "none":
+                    x, donors = images, ids
+                else:
+                    bank = banks[bg_of[mode]]
+                    d = _pick_donors(bank, coverage, labels.numpy(), ids, rng)
+                    bg = bank["images"][d].to(device, images.dtype)
+                    x = images * organism + bg * (1 - organism)
+                    donors = bank["image_ids"][d]
+                with torch.no_grad():
+                    x = x.contiguous(memory_format=torch.channels_last)
+                    for name, m in models.items():
+                        with torch.autocast(device.type, dtype=torch.float16,
+                                            enabled=device.type == "cuda"):
+                            probs = m(x).float().softmax(dim=1)
+                        conf, pred = probs.max(dim=1)
+                        lab, prd, cnf, don = rec[(name, mode)]
+                        lab.append(labels)
+                        prd.append(pred.cpu())
+                        cnf.append(conf.cpu())
+                        don.append(donors)
+        for (name, mode), (lab, prd, cnf, don) in rec.items():
+            lab, prd = torch.cat(lab).tolist(), torch.cat(prd).tolist()
+            out.append(pd.DataFrame({
+                "model": name, "split": split, "mode": mode, "bg_split": bg_of[mode],
+                "image_id": ds.image_ids, "ann_id": ds.ann_ids,
+                "species": [species_list[i] for i in lab],
+                "pred": [species_list[i] for i in prd],
+                "confidence": torch.cat(cnf).tolist(),
+                "correct": [a == b for a, b in zip(lab, prd)],
+                "donor_image_id": np.concatenate(don),
+            }))
+        print(f"{split}: {len(ds)} crops x {len(SWAP_MODES)} modes x {len(models)} models done")
+    return pd.concat(out, ignore_index=True)
+
+
+def swap_decomposition(preds, species, n_boot=2000, seed=config.RANDOM_SEED):
+    """Split each model's degradation into a background part and an organism part.
+
+    With mean per-species accuracy acc[organism depth][background depth] on
+    the composites (S = shallow, D = deep), the degradation on composites is
+    SS - DD, and it splits exactly into
+        background_effect = ((SS - SD) + (DS - DD)) / 2
+        organism_effect   = ((SS - DS) + (SD - DD)) / 2
+    i.e. how much accuracy falls when only the background, or only the
+    organism, moves from shallow to deep. background_share is
+    background_effect / composite_degradation, which is only meaningful when
+    the composite degradation is clearly above 0 (so not for the control).
+    compositing_cost is original accuracy minus same-depth composite
+    accuracy, averaged over both splits.
+
+    Species are resampled with replacement for 95% confidence intervals, as
+    in bootstrap_intervention.
+
+    Returns:
+        DataFrame with columns model, metric, estimate, ci_low, ci_high,
+        and significant (interval excludes 0).
+    """
+    wide = intervention_per_species(preds, species).dropna()
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(wide), size=(n_boot, len(wide)))
+
+    rows = []
+
+    def add(model, metric, est, boot):
+        lo, hi = np.percentile(boot, [2.5, 97.5])
+        rows.append({"model": model, "metric": metric, "estimate": float(est),
+                     "ci_low": lo, "ci_high": hi, "significant": bool(lo > 0 or hi < 0)})
+
+    for model in preds["model"].unique():
+        def acc(split, mode):
+            return wide[f"{model}_{split}_{mode}"].values
+
+        ss, dd = acc("shallow", "swap_same"), acc("deep", "swap_same")
+        sd, ds_ = acc("shallow", "swap_other"), acc("deep", "swap_other")
+        per_species = {
+            "original_degradation": acc("shallow", "none") - acc("deep", "none"),
+            "composite_degradation": ss - dd,
+            "background_effect": ((ss - sd) + (ds_ - dd)) / 2,
+            "organism_effect": ((ss - ds_) + (sd - dd)) / 2,
+            "compositing_cost": ((acc("shallow", "none") - ss) + (acc("deep", "none") - dd)) / 2,
+        }
+        for metric, v in per_species.items():
+            add(model, metric, v.mean(), v[idx].mean(axis=1))
+        bg, comp = per_species["background_effect"], per_species["composite_degradation"]
+        add(model, "background_share", bg.mean() / comp.mean(),
+            bg[idx].mean(axis=1) / comp[idx].mean(axis=1))
+    print(f"Swap decomposition over {len(wide)} species, {n_boot} resamples")
+    return pd.DataFrame(rows)
+
+
+def plot_swap(preds, species, save_path=None):
+    """One panel per model: mean per-species accuracy on the composites,
+    grouped by organism depth and coloured by background depth."""
+    wide = intervention_per_species(preds, species).dropna()
+    models = list(preds["model"].unique())
+    fig, axes = plt.subplots(1, len(models), figsize=(3.4 * len(models), 2.8),
+                             sharey=True, squeeze=False)
+    x = np.arange(2)
+    w = 0.36
+    for ax, model in zip(axes[0], models):
+        for offset, bg in ((-w / 2, "shallow"), (w / 2, "deep")):
+            vals = [wide[f"{model}_{org}_{'swap_same' if org == bg else 'swap_other'}"].mean()
+                    for org in ("shallow", "deep")]
+            bars = ax.bar(x + offset, vals, width=w - 0.04, color=SPLIT_COLORS[bg],
+                          label=f"{bg.capitalize()} background")
+            ax.bar_label(bars, fmt="%.2f", fontsize=6, color=INK_MUTED, padding=2)
+        ax.set_xticks(x, ["Shallow organism", "Deep organism"])
+        ax.set_title(f"{model.capitalize()} model", fontsize=8)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.tick_params(labelsize=7)
+        ax.grid(axis="y", alpha=0.25)
+    axes[0][0].set_ylabel("Mean per-species accuracy", fontsize=8)
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    fig.suptitle("Accuracy with backgrounds swapped between depths", fontsize=8, y=1.04)
+    fig.legend(handles, labels, loc="upper center", ncol=2, frameon=False,
+               bbox_to_anchor=(0.5, 0.99), fontsize=7)
+    plt.tight_layout()
+    _save(fig, save_path)
+    plt.show()
+    return fig
+
+
+def show_swaps(loaders, banks, split="shallow", idxs=(0,), seed=config.RANDOM_SEED,
+               save_path=None):
+    """Visual check: each crop, its organism on a same-depth background and on
+    an other-depth background, one row per crop."""
+    ds = loaders[split].dataset
+    other = next(s for s in loaders if s != split)
+    rng = np.random.default_rng(seed)
+    mean = torch.tensor(data.IMAGENET_MEAN).view(3, 1, 1)
+    std = torch.tensor(data.IMAGENET_STD).view(3, 1, 1)
+    fig, axes = plt.subplots(len(idxs), 3, figsize=(9, 3 * len(idxs)), squeeze=False)
+    for row, i in zip(axes, idxs):
+        img, label, mask = ds[i]
+        organism = mask.float()[None]
+        panels = [("Original", img)]
+        for title, bg_split in ((f"{split.capitalize()} background", split),
+                                (f"{other.capitalize()} background", other)):
+            bank = banks[bg_split]
+            d = _pick_donors(bank, [float(mask.float().mean())], [int(label)],
+                             [ds.image_ids[i]], rng)[0]
+            panels.append((title, img * organism + bank["images"][d].float() * (1 - organism)))
+        for ax, (title, x) in zip(row, panels):
+            ax.imshow((x * std + mean).clamp(0, 1).permute(1, 2, 0).numpy())
+            ax.set_title(title, fontsize=9)
+            ax.axis("off")
+        row[0].set_ylabel(loaders[split].species_list[label], fontsize=9)
+    fig.suptitle(f"{split.capitalize()} organisms on swapped backgrounds", fontsize=10)
     plt.tight_layout()
     _save(fig, save_path)
     plt.show()

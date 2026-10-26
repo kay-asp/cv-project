@@ -101,22 +101,47 @@ def compute_degradation(shallow_acc, deep_acc):
     }
 
 
-def majority_class_baseline(dataloader):
-    """Accuracy of a majority-class predictor (trivial baseline).
+def majority_class_baseline(train_loader, eval_loader, species_list=None):
+    """Mean per-species accuracy of always predicting the training majority class.
 
-    Counts the dataset's labels to find the most frequent one, then reports
-    the accuracy that predicting only that label would achieve — i.e. its
-    empirical frequency.
+    The trivial baseline fixes a single prediction — the most frequent class in
+    the *training* set — and is scored the same way as the models: per-species
+    accuracy, then averaged over species (macro), so it's directly comparable to
+    the "Mean shallow/deep accuracy" numbers. On the evaluation set the majority
+    species scores 1.0 and every other present species 0.0, so the result is
+    close to 1 / (number of species present), the floor the models sit above.
+    (This is much lower than the old empirical-frequency number, which was a
+    micro accuracy and not comparable to the macro per-species means.)
+
+    Args:
+        train_loader: Training DataLoader; its dataset.labels decide the
+            majority class (the prediction a real baseline would commit to).
+        eval_loader: DataLoader to score on (e.g. the shallow test loader).
+        species_list: Class order (label index = position). Defaults to
+            eval_loader.species_list.
 
     Returns:
-        float: majority-class accuracy
+        float: mean per-species accuracy of the majority-class predictor, or
+        0.0 if the training set is empty.
     """
-    labels = dataloader.dataset.labels
-    if not labels:
-        return 0.0
+    if species_list is None:
+        species_list = eval_loader.species_list
 
-    _, majority_count = Counter(labels).most_common(1)[0]
-    return majority_count / len(labels)
+    train_labels = train_loader.dataset.labels
+    if not train_labels:
+        return 0.0
+    majority_label, _ = Counter(train_labels).most_common(1)[0]
+
+    # Per-species accuracy of the constant predictor: 1.0 for the majority
+    # species, 0.0 for the rest; species absent from the eval set are nan so
+    # they drop out of the mean, matching accuracy_from_predictions.
+    eval_counts = Counter(eval_loader.dataset.labels)
+    per_species = {
+        species: (float("nan") if eval_counts.get(idx, 0) == 0
+                  else float(idx == majority_label))
+        for idx, species in enumerate(species_list)
+    }
+    return float(pd.Series(per_species).mean())
 
 
 def evaluate_control_model(control_model, shallow_loader, deep_loader, species_list):

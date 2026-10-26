@@ -40,6 +40,8 @@ NUM_WORKERS = None          # None = os.cpu_count() (Colab gives 2, the cluster 
 
 # ── Attribution ──────────────────────────────────────────────────────
 GRADCAM_TARGET_LAYER = "layer4"  # Final conv block of ResNet-50
+GRADCAM_SIZE = (7, 7)       # layer4 output for an IMG_SIZE input (stride 32); CRS is scored on this grid
+CRS_DILATE_PX = 3           # Grow organism masks by this before scoring CRS (same as the interventions' dilate_px)
 
 # ── Evaluation ───────────────────────────────────────────────────────
 RANDOM_SEED = 42

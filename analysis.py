@@ -17,7 +17,7 @@ from scipy.stats import spearmanr
 MARK_COLOR = "#2a6fdb"
 INK_MUTED = "#555555"
 
-def select_qualifying_species(per_species_df, min_test_n=5):
+def select_qualifying_species(per_species_df, min_test_n=5, crs_col="shallow_crs"):
     """Species that can take part in the correlation.
  
     A species qualifies when it has at least min_test_n shallow test crops
@@ -25,8 +25,9 @@ def select_qualifying_species(per_species_df, min_test_n=5):
     and has a CRS value.
  
     Args:
-        per_species_df: results table with n_shallow_test, n_deep_test, crs.
+        per_species_df: results table with n_shallow_test, n_deep_test and crs_col.
         min_test_n: minimum test crops on each side.
+        crs_col: the CRS column that must be present.
  
     Returns:
         list of species names.
@@ -34,7 +35,7 @@ def select_qualifying_species(per_species_df, min_test_n=5):
     df = per_species_df
     ok = ((df["n_shallow_test"] >= min_test_n)
           & (df["n_deep_test"] >= min_test_n)
-          & df["crs"].notna())
+          & df[crs_col].notna())
     keep = df.index[ok].tolist()
     print(f"{len(keep)} / {len(df)} species qualify "
           f"(>= {min_test_n} shallow and deep test crops, CRS available)")
@@ -67,8 +68,50 @@ def spearman_correlation(crs_scores, degradation_scores, species=None):
     return float(rho), float(p)
 
 
+def bootstrap_spearman(image_crs, degradation_scores, species=None, n_boot=2000, seed=42):
+    """Bootstrap CI for Spearman(species mean CRS, degradation).
+
+    Species CRS from a handful of crops is noisy. Each resample redraws every
+    species' crops with replacement, recomputes its mean CRS, and recorrelates
+    with degradation, so the CI shows how much ρ moves with that noise.
+    (Degradation is held fixed: only the CRS side is resampled.)
+
+    Args:
+        image_crs: per-image CRS DataFrame (species, crs) for the shallow split.
+        degradation_scores: dict species -> degradation.
+        species: optional list to restrict to.
+        n_boot: number of resamples.
+        seed: random seed.
+
+    Returns:
+        dict with rho (on the full data), ci_low, ci_high (95% percentile) and n.
+    """
+    from scipy.stats import rankdata
+    from attribution import _bootstrap_means
+
+    df = image_crs.dropna(subset=["crs"])
+    names = species if species is not None else sorted(df["species"].unique())
+    groups = {s: v.to_numpy() for s, v in df.groupby("species")["crs"]}
+    names = [s for s in names if s in groups and np.isfinite(degradation_scores.get(s, np.nan))]
+    if len(names) < 3:
+        raise ValueError(f"Only {len(names)} species with both values - can't correlate")
+
+    rng = np.random.default_rng(seed)
+    boot = np.column_stack([_bootstrap_means(groups[s], n_boot, rng) for s in names])  # (n_boot, n_species)
+    deg = rankdata([degradation_scores[s] for s in names])
+    ranks = rankdata(boot, axis=1)
+    rhos = np.array([np.corrcoef(r, deg)[0, 1] for r in ranks])
+
+    rho = float(spearmanr([groups[s].mean() for s in names], deg)[0])
+    lo, hi = np.percentile(rhos, [2.5, 97.5])
+    print(f"Spearman ρ = {rho:.3f}, 95% bootstrap CI [{lo:.3f}, {hi:.3f}] over {len(names)} species "
+          f"(crops resampled within species, {n_boot} resamples)")
+    return {"rho": rho, "ci_low": float(lo), "ci_high": float(hi), "n": len(names)}
+
+
 def plot_crs_vs_degradation(crs_scores, degradation_scores, species=None,
-                            rho=None, p_value=None, n_labels=5, save_path=None):
+                            rho=None, p_value=None, n_labels=5, ylabel="Degradation",
+                            save_path=None):
     """Scatter plot: CRS (x) vs degradation (y) for each species.
     
     Labels the n_labels species furthest from the centre of the cloud, so the
@@ -90,12 +133,13 @@ def plot_crs_vs_degradation(crs_scores, degradation_scores, species=None,
         ax.annotate(s, (x[s], y[s]), xytext=(5, 5), textcoords="offset points",
                     fontsize=6, color=INK_MUTED)
  
-    title = "Context reliance vs depth degradation"
+    title = ("Context reliance vs depth degradation" if ylabel == "Degradation"
+             else f"Context reliance vs {ylabel.lower()}")
     if rho is not None:
         title += f"\nρ = {rho:.3f}, p = {p_value:.3g}, n = {len(x)}"
     ax.set_title(title, fontsize=8, pad=6)
     ax.set_xlabel("Context Reliance Score", fontsize=8)
-    ax.set_ylabel("Degradation", fontsize=8)
+    ax.set_ylabel(ylabel, fontsize=8)
     ax.spines[["top", "right"]].set_visible(False)
     ax.tick_params(labelsize=7)
     ax.grid(alpha=0.25)
@@ -105,6 +149,90 @@ def plot_crs_vs_degradation(crs_scores, degradation_scores, species=None,
         fig.savefig(save_path, dpi=300)
     plt.show()
     return fig
+
+
+def crs_depth_model(predictions, per_species_df, species=None, crs_col="shallow_crs",
+                    depth_df=None, depth_threshold=None, models=("shallow",)):
+    """Crop-level test: does accuracy fall more at depth for high-CRS species?
+
+    Fits correct ~ depth * crs on every test crop instead of one degradation
+    value per species, so species with more crops count more and depth can be
+    continuous. crs is the species' shallow CRS (standardised over the species
+    used), never the crop's own CRS: a deep crop's CRS is itself affected by
+    the shift and by whether the prediction was wrong. Two fits:
+
+      - GEE (logistic, independence working correlation, robust SEs clustered
+        by species): crops of one species aren't treated as independent.
+      - Bayesian mixed logistic model with a random intercept per species
+        (variational fit): each species keeps its own baseline accuracy.
+        p-values are normal approximations from the posterior mean and SD.
+
+    depth is the deep-split indicator (0/1), or with depth_df the depth in km
+    relative to depth_threshold. The depth:crs coefficient is the hypothesis
+    test (log-odds of a correct prediction): negative = high-CRS species lose
+    more accuracy at depth. With both models, a shallow_model indicator is
+    added and depth:crs:shallow_model asks whether that holds more for the
+    shallow-trained model than for the control.
+
+    Args:
+        predictions: predictions.csv (model, split, image_id, species, correct).
+        per_species_df: results table indexed by species, with crs_col.
+        species: optional list to restrict to.
+        crs_col: species-level CRS column ('shallow_crs', 'shallow_crs_excess', ...).
+        depth_df: optional DataFrame with image_id, depth_m for continuous depth.
+        depth_threshold: shallow/deep cutoff in m (needed with depth_df).
+        models: which models' predictions to fit.
+
+    Returns:
+        DataFrame with columns method, term, coef, se, ci_low, ci_high, p.
+    """
+    import statsmodels.api as sm
+    import statsmodels.formula.api as smf
+    from scipy.stats import norm
+    from statsmodels.genmod.bayes_mixed_glm import BinomialBayesMixedGLM
+
+    df = predictions[predictions["model"].isin(models)].copy()
+    if species is not None:
+        df = df[df["species"].isin(species)]
+    crs = per_species_df[crs_col].reindex(df["species"].unique()).dropna()
+    df["crs"] = df["species"].map((crs - crs.mean()) / crs.std())
+    df["correct"] = df["correct"].astype(int)
+    if depth_df is None:
+        df["depth"] = (df["split"] == "deep").astype(float)
+        depth_label = "deep split (0/1)"
+    else:
+        if depth_threshold is None:
+            raise ValueError("depth_df needs depth_threshold")
+        depth = depth_df[["image_id", "depth_m"]].drop_duplicates("image_id")
+        df = df.merge(depth, on="image_id", how="left")
+        df["depth"] = (df["depth_m"] - depth_threshold) / 1000
+        depth_label = f"km relative to {depth_threshold} m"
+    df = df.dropna(subset=["crs", "depth"])
+
+    formula, key = "correct ~ depth * crs", "depth:crs"
+    if len(models) > 1:
+        df["shallow_model"] = (df["model"] == "shallow").astype(float)
+        formula, key = "correct ~ depth * crs * shallow_model", "depth:crs:shallow_model"
+
+    gee = smf.gee(formula, groups="species", data=df, family=sm.families.Binomial(),
+                  cov_struct=sm.cov_struct.Independence()).fit()
+    ci = gee.conf_int()
+    rows = [{"method": "GEE", "term": t, "coef": gee.params[t], "se": gee.bse[t],
+             "ci_low": ci.loc[t, 0], "ci_high": ci.loc[t, 1], "p": gee.pvalues[t]}
+            for t in gee.params.index]
+
+    glmm = BinomialBayesMixedGLM.from_formula(formula, {"species": "0 + C(species)"}, df).fit_vb()
+    for t, m, s in zip(glmm.model.exog_names, glmm.fe_mean, glmm.fe_sd):
+        rows.append({"method": "Mixed (species intercept)", "term": t, "coef": m, "se": s,
+                     "ci_low": m - 1.96 * s, "ci_high": m + 1.96 * s, "p": 2 * norm.sf(abs(m / s))})
+
+    out = pd.DataFrame(rows)
+    print(f"{formula}: {len(df)} crops, {df['species'].nunique()} species, "
+          f"depth = {depth_label}, crs = {crs_col} (standardised)")
+    for _, r in out[out["term"] == key].iterrows():
+        print(f"  {r['method']}: {key} = {r['coef']:.3f} [{r['ci_low']:.3f}, {r['ci_high']:.3f}], "
+              f"p = {r['p']:.3g}")
+    return out
 
 
 def plot_baseline_comparison(crs_scores, uniform_crs, gaussian_crs, species=None,
@@ -222,6 +350,70 @@ def plot_accuracy_vs_depth(predictions, depth_df, depth_threshold=None,
     if species_weighted:
         title += " (species-weighted)"
     ax.set_title(title, fontsize=8, pad=6)
+    ax.legend(fontsize=7, frameon=False)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.tick_params(labelsize=7)
+    ax.grid(alpha=0.25)
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=300)
+    plt.show()
+    return fig
+
+
+def plot_crs_vs_depth(image_crs_by_model, depth_df, crs_col="crs", depth_threshold=None,
+                      n_bins=15, species=None, species_weighted=False, show_chance=True,
+                      save_path=None):
+    """Line graph of mean CRS vs depth for each model, on the shallow + deep test crops.
+
+    Args:
+        image_crs_by_model: dict model name -> image_crs table (both splits),
+            e.g. {'shallow': image_crs.csv, 'control': image_crs_control.csv}.
+        depth_df: DataFrame with columns image_id, depth_m.
+        crs_col: 'crs' (true class), 'crs_pred' (predicted class), or an _excess column.
+        depth_threshold: If given, draw a vertical line at the shallow/deep cutoff.
+        n_bins: Number of equal-frequency depth bins (shared by all models).
+        species: optional list to restrict to.
+        species_weighted: average per-species means within each bin, as in
+            plot_accuracy_vs_depth.
+        show_chance: also draw the flat-map CRS (1 - coverage), which is the same
+            for every model; if CRS follows it, the change is mask size, not attention.
+        save_path: If provided, save the figure to this path.
+    """
+    depth = depth_df[["image_id", "depth_m"]].drop_duplicates("image_id")
+    df = pd.concat([d.assign(model=m) for m, d in image_crs_by_model.items()], ignore_index=True)
+    if species is not None:
+        df = df[df["species"].isin(species)]
+    df = df.merge(depth, on="image_id", how="left").dropna(subset=["depth_m", crs_col])
+    df["bin_mid"] = pd.qcut(df["depth_m"], n_bins, duplicates="drop").apply(lambda b: b.mid)
+
+    def binned(sub, col):
+        if not species_weighted:
+            return sub.groupby("bin_mid", observed=True)[col].mean()
+        return sub.groupby(["bin_mid", "species"], observed=True)[col].mean().groupby("bin_mid").mean()
+
+    colors = {"shallow": MARK_COLOR, "control": "#eb6834"}
+    labels = {"shallow": "Shallow-trained", "control": "Control (all depths)"}
+    fig, ax = plt.subplots(figsize=(3.4, 2.8))
+    for model in image_crs_by_model:
+        crs = binned(df[df["model"] == model], crs_col)
+        ax.plot(crs.index, crs.values, marker="o", markersize=3, linewidth=1.2,
+                label=labels.get(model, model), color=colors.get(model, INK_MUTED))
+    if show_chance and not crs_col.endswith("_excess"):
+        first = df[df["model"] == next(iter(image_crs_by_model))]
+        chance = binned(first, "crs_chance")
+        ax.plot(chance.index, chance.values, linestyle=":", linewidth=1.2, color="#999999",
+                label="Chance (flat map)")
+    if depth_threshold is not None:
+        ax.axvline(depth_threshold, color=INK_MUTED, linestyle="--", linewidth=0.8,
+                   label=f"Depth threshold ({depth_threshold} m)")
+
+    which = "predicted class" if crs_col.startswith("crs_pred") else "true class"
+    ax.set_xlabel("Depth (m)", fontsize=8)
+    ax.set_ylabel(f"Mean {crs_col.replace('_', ' ').replace('crs', 'CRS')}", fontsize=8)
+    ax.set_title(f"Context reliance vs depth ({which})"
+                 + (" (species-weighted)" if species_weighted else ""), fontsize=8, pad=6)
     ax.legend(fontsize=7, frameon=False)
     ax.spines[["top", "right"]].set_visible(False)
     ax.tick_params(labelsize=7)

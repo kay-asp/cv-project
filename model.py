@@ -10,14 +10,31 @@ Responsibilities:
 
 import copy
 import os
+import random
+import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import models
 
-import config
 
+import config 
+
+def set_seed(seed=config.RANDOM_SEED): # addresses a different source of randomness
+    random.seed(seed) # 
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    #torch.backends.cudnn.benchmark = False #had to remove it otherwise training function will override reproducibulity setting.
+    
+
+    print(f"Random seed set to {seed}")
 
 def build_classifier(num_classes, pretrained=config.PRETRAINED):
     # create ResNet-50 with fresh classification head
@@ -33,7 +50,8 @@ def train(model, train_loader, val_loader, epochs, lr, resume_path):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device, memory_format=torch.channels_last)
-    torch.backends.cudnn.benchmark = True
+    
+    #torch.backends.cudnn.benchmark = True #could override benchmark = false setting in the new seed function
     use_amp = config.USE_AMP and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
