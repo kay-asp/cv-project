@@ -7,7 +7,7 @@ Does a deep-sea classification model's reliance on background context predict ho
 
 1. **`train.ipynb`** [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kay-asp/cv-project/blob/main/train.ipynb)\
    builds crops/masks, trains both models (shallow-only classifier and
-   the all-depths control), runs predictions, Grad-CAM + CRS, and background interventions. Writes
+   the all-depths control), runs predictions, Grad-CAM + CRS, and background interventions (multi-hour run). Writes
    all CSVs to `results/` and checkpoints to `checkpoints/`
    
    
@@ -23,6 +23,13 @@ For `train.ipynb`:
 
 1. Set the runtime to a GPU: **Runtime → Change runtime type → T4 GPU**.
 2. **Runtime → Run all**.
+
+> **Colab will not save results outside of the virtual memory**
+> it allows a full run & reproduction from scratch, and produces every training output, but everything a run produces
+> (crops, masks, checkpoints, `results/`) is written to the temporary Colab VM and is lost when the
+> session ends or disconnects, unless you download it during the session — nothing is written back to this repo or to Drive. The committed
+> `results/` already contains our run, so `analysis.ipynb` reproduces the figures without retraining.
+> **If you want to do a clean run and keep the new results, clone and run locally** (see below).
 
 
 ## Run it locally
