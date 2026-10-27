@@ -2,7 +2,13 @@
 
 Does a deep-sea classification model's reliance on background context predict how badly it degrades at depth?
 
-We test whether Grad-CAM attribution spillover outside an organism's segmentation mask (Context Reliance Score) correlates with misclassification as survey depth moves beyond the training distribution.
+## Training and Analysis Notebooks
+
+1. **`train.ipynb`** (GPU) — builds crops/masks, trains both models (shallow-only classifier and
+   the all-depths control), runs predictions, Grad-CAM + CRS, and background interventions. Writes
+   all CSVs to `results/` and checkpoints to `checkpoints/`.
+2. **`analysis.ipynb`** (CPU) — reads `results/*.csv` and produces the statistics and plots
+   (CRS–degradation correlation, baselines, bootstrap CIs, etc.). No GPU required.
 
 ## Run it in Google Colab (recommended)
 
@@ -55,18 +61,11 @@ stays small.
   resumable (already-built crops are skipped), and can take a while on a cold run. No shared drive
   or external hosting is involved.
 
-## Commands / run order
-
-1. **`train.ipynb`** (GPU) — builds crops/masks, trains both models (shallow-only classifier and
-   the all-depths control), runs predictions, Grad-CAM + CRS, and background interventions. Writes
-   all CSVs to `results/` and checkpoints to `checkpoints/`.
-2. **`analysis.ipynb`** (CPU) — reads `results/*.csv` and produces the statistics and plots
-   (CRS–degradation correlation, baselines, bootstrap CIs, etc.). No GPU required.
-3. **`comparing-the-runs.ipynb`** — checks that seeded training reproduces, by comparing the
-   validation-accuracy histories of two labelled runs (`HISTORY_RUN = "run1"` / `"run2"`).
 
 ## Reproducibility
 
+- **`comparing-the-runs.ipynb`** — checks that seeded training reproduces, by comparing the
+   validation-accuracy histories of two labelled runs (`HISTORY_RUN = "run1"` / `"run2"`).
 - The random seed is `config.RANDOM_SEED = 42`, applied via `model.set_seed()` (seeds `random`,
   `numpy`, `torch`, CUDA, and sets `cudnn.deterministic`).
 - The train/val/test split is deterministic — a hash of `(seed, image_id)` — so every run and
