@@ -2,12 +2,18 @@
 Shared configuration: paths, hyperparameters, depth thresholds.
 """
 
+import os
+
+# On Colab, keep the crop/mask caches on the fast local VM disk (/content), not under the
+# cloned repo — this is why reads/writes stay fast. Locally they sit under the repo root.
+_IN_COLAB = os.path.isdir("/content")
+
 # ── Paths ────────────────────────────────────────────────────────────
-CROP_DIR = "/content/crops/"   # Crops, extracted from CROP_ARCHIVE each Colab session (fast VM disk)
-CROP_ARCHIVE = "crops.tar"    # On the Shared Drive, so the group shares one copy
+CROP_DIR = "/content/crops/" if _IN_COLAB else "crops/"   # Crops cache (fast local disk on Colab)
+CROP_ARCHIVE = "crops.tar"    # Optional local cache; rebuilt from FathomNet when absent
 DATA_DIR = "data/"
-MASK_DIR = "/content/masks/"   # Crop-aligned masks, cached by get_crop_mask (fast VM disk, like CROP_DIR)
-MASK_ARCHIVE = "masks.tar"    # On the Shared Drive, like CROP_ARCHIVE
+MASK_DIR = "/content/masks/" if _IN_COLAB else "masks/"   # Crop-aligned masks cache (fast local disk on Colab)
+MASK_ARCHIVE = "masks.tar"    # Optional local cache, like CROP_ARCHIVE
 MODEL_SAVE_PATH = "checkpoints/"
 RESULTS_DIR = "results/"
 

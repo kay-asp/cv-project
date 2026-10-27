@@ -1,5 +1,28 @@
-*.json
+# Python
+__pycache__/
 *.pyc
-*.tar.gz
-*.pt
-*.pt.resume
+
+# Downloaded / built data — see "How to get the data" in the README.
+# train.json (~280 MB COCO metadata, downloaded by train.ipynb) must NOT be committed;
+# depth_cache.csv (~2 MB of FathomNet depth lookups) IS committed so a fresh run skips the API crawl.
+data/*
+!data/depth_cache.csv
+# Crops and masks are rebuilt from FathomNet
+crops/
+masks/
+*.tar
+
+# Model checkpoints: ignore the large weights/resume files, but KEEP the tiny
+# *_history_*.npy run records that comparing-the-runs.ipynb needs.
+checkpoints/*.pt
+checkpoints/*.resume
+checkpoints/*.pt.resume
+
+# Notebook / env
+.ipynb_checkpoints/
+.env
+
+# Local reference copy of the previous version — not part of the project
+cv_project_26_10/
+
+# Note: results/ is intentionally committed as evidence of a run.

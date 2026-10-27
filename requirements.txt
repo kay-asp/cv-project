@@ -1,8 +1,18 @@
-torch
-torchvision
-numpy
-pandas
-matplotlib
-scipy
-grad-cam
-fathomnet
+# Reference environment that produced results/: Google Colab (Tesla T4 GPU),
+# torch 2.11.0+cu130, CUDA 13.0. On Colab the scientific stack below is already
+# preinstalled, so the Colab notebook installs only the extras (fathomnet,
+# grad-cam, pycocotools). These pins are for a LOCAL install and are known to be
+# mutually compatible; to reproduce a specific run exactly, regenerate this file
+# from that environment with `pip freeze`.
+torch==2.3.1
+torchvision==0.18.1
+numpy==1.26.4
+pandas==2.2.2
+matplotlib==3.9.0
+scipy==1.13.1
+grad-cam==1.5.7
+fathomnet==1.10.2
+pycocotools==2.0.7
+Pillow==10.3.0
+requests==2.32.3
+jupyter==1.0.0
