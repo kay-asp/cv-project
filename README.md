@@ -2,22 +2,26 @@
 
 Does a deep-sea classification model's reliance on background context predict how badly it degrades at depth?
 
-## Training and Analysis Notebooks
-
-1. **`train.ipynb`** (GPU) — builds crops/masks, trains both models (shallow-only classifier and
-   the all-depths control), runs predictions, Grad-CAM + CRS, and background interventions. Writes
-   all CSVs to `results/` and checkpoints to `checkpoints/`.
-2. **`analysis.ipynb`** (CPU) — reads `results/*.csv` and produces the statistics and plots
-   (CRS–degradation correlation, baselines, bootstrap CIs, etc.). No GPU required.
 
 ## Run it in Google Colab (recommended)
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kay-asp/cv-project/blob/main/train.ipynb)
 
-Open: https://colab.research.google.com/github/kay-asp/cv-project/blob/main/train.ipynb
+1. **`train.ipynb`** [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kay-asp/cv-project/blob/main/train.ipynb)\
+   builds crops/masks, trains both models (shallow-only classifier and
+   the all-depths control), runs predictions, Grad-CAM + CRS, and background interventions. Writes
+   all CSVs to `results/` and checkpoints to `checkpoints/`
+   
+   
+3. **`analysis.ipynb`** [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kay-asp/cv-project/blob/main/analysis.ipynb) \
+   reads `results/*.csv` and produces the statistics and plots
+   (CRS–degradation correlation, baselines, bootstrap CIs, etc.). No GPU required.
+   
+
 
 No Google Drive access is needed. The notebook's first cell clones this public repository and
-installs dependencies; `train.ipynb` then downloads the FathomNet metadata it needs. Then:
+installs dependencies; `train.ipynb` then downloads the FathomNet metadata it needs. \
+\
+For `train.ipynb`:
 
 1. Set the runtime to a GPU: **Runtime → Change runtime type → T4 GPU**.
 2. **Runtime → Run all**.
