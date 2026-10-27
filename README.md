@@ -5,7 +5,6 @@ Does a deep-sea classification model's reliance on background context predict ho
 
 ## Run it in Google Colab (recommended)
 
-
 1. **`train.ipynb`** [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kay-asp/cv-project/blob/main/train.ipynb)\
    builds crops/masks, trains both models (shallow-only classifier and
    the all-depths control), runs predictions, Grad-CAM + CRS, and background interventions. Writes
@@ -17,14 +16,14 @@ Does a deep-sea classification model's reliance on background context predict ho
    (CRS–degradation correlation, baselines, bootstrap CIs, etc.). No GPU required.
    
 
-
-No Google Drive access is needed. The notebook's first cell clones this public repository and
-installs dependencies; `train.ipynb` then downloads the FathomNet metadata it needs. \
+Click the Colab link for each notebook to open and run in Google Colab. The notebook's first cell clones this public repository and
+installs dependencies; `train.ipynb` then downloads the FathomNet metadata it needs (No Google Drive access needed). \
 \
 For `train.ipynb`:
 
 1. Set the runtime to a GPU: **Runtime → Change runtime type → T4 GPU**.
 2. **Runtime → Run all**.
+
 
 ## Run it locally
 
@@ -68,8 +67,8 @@ stays small.
 
 ## Reproducibility
 
-- **`comparing-the-runs.ipynb`** — checks that seeded training reproduces, by comparing the
-   validation-accuracy histories of two labelled runs (`HISTORY_RUN = "run1"` / `"run2"`).
+- **`comparing-the-runs.ipynb`** [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/kay-asp/cv-project/blob/main/comparing-the-runs.ipynb) \
+     checks that seeded training reproduces, by comparing the validation-accuracy histories of two labelled runs (`HISTORY_RUN = "run1"` / `"run2"`).
 - The random seed is `config.RANDOM_SEED = 42`, applied via `model.set_seed()` (seeds `random`,
   `numpy`, `torch`, CUDA, and sets `cudnn.deterministic`).
 - The train/val/test split is deterministic — a hash of `(seed, image_id)` — so every run and
@@ -96,3 +95,8 @@ stays small.
 ├── data/                     # depth_cache.csv (committed); train.json downloaded on first run (gitignored)
 └── results/                  # Saved CSVs and figures from our run
 ```
+
+Google Colab Full Links (if 'Open in Colab' link doesn't work):
+1. **`train.ipynb`** - https://colab.research.google.com/github/kay-asp/cv-project/blob/main/train.ipynb
+2. **`analysis.ipynb`** - https://colab.research.google.com/github/kay-asp/cv-project/blob/main/analysis.ipynb
+3. **`comparing-the-runs.ipynb`** -  https://colab.research.google.com/github/kay-asp/cv-project/blob/main/comparing-the-runs.ipynb
