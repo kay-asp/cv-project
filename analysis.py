@@ -109,6 +109,41 @@ def bootstrap_spearman(image_crs, degradation_scores, species=None, n_boot=2000,
     return {"rho": rho, "ci_low": float(lo), "ci_high": float(hi), "n": len(names)}
 
 
+def bootstrap_spearman_species(crs_scores, degradation_scores, species=None, n_boot=2000, seed=42):
+    """Bootstrap CI for Spearman(CRS, degradation), resampling species.
+
+    Species are the unit of analysis, so each resample draws species with
+    replacement (keeping each species' CRS and degradation together) and
+    recorrelates. Unlike bootstrap_spearman, this reflects which species
+    happened to be sampled, the same unit the intervention CIs resample.
+
+    Args:
+        crs_scores: dict species -> CRS
+        degradation_scores: dict species -> degradation
+        species: optional list to restrict to.
+        n_boot: number of resamples.
+        seed: random seed.
+
+    Returns:
+        dict with rho (on the full data), ci_low, ci_high (95% percentile) and n.
+    """
+    x, y = _paired(crs_scores, degradation_scores, species)
+    if len(x) < 3:
+        raise ValueError(f"Only {len(x)} species with both values - can't correlate")
+    x, y = x.to_numpy(), y.to_numpy()
+
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(x), size=(n_boot, len(x)))
+    rhos = np.array([spearmanr(x[i], y[i])[0] for i in idx])
+    rhos = rhos[np.isfinite(rhos)]
+
+    rho = float(spearmanr(x, y)[0])
+    lo, hi = np.percentile(rhos, [2.5, 97.5])
+    print(f"Spearman ρ = {rho:.3f}, 95% bootstrap CI [{lo:.3f}, {hi:.3f}] over {len(x)} species "
+          f"(species resampled, {n_boot} resamples)")
+    return {"rho": rho, "ci_low": float(lo), "ci_high": float(hi), "n": len(x)}
+
+
 def plot_crs_vs_degradation(crs_scores, degradation_scores, species=None,
                             rho=None, p_value=None, n_labels=5, ylabel="Degradation",
                             save_path=None):
@@ -345,10 +380,9 @@ def plot_accuracy_vs_depth(predictions, depth_df, depth_threshold=None,
                    linewidth=0.8, label=f"Depth threshold ({depth_threshold} m)")
 
     ax.set_xlabel("Depth (m)", fontsize=8)
-    ax.set_ylabel("Accuracy", fontsize=8)
-    title = "Accuracy vs depth"
-    if species_weighted:
-        title += " (species-weighted)"
+    ax.set_ylabel("Mean per-species accuracy" if species_weighted else "Accuracy (pooled over crops)",
+                  fontsize=8)
+    title = "Per-species accuracy vs depth" if species_weighted else "Accuracy vs depth"
     ax.set_title(title, fontsize=8, pad=6)
     ax.legend(fontsize=7, frameon=False)
     ax.spines[["top", "right"]].set_visible(False)
@@ -424,6 +458,90 @@ def plot_crs_vs_depth(image_crs_by_model, depth_df, crs_col="crs", depth_thresho
         fig.savefig(save_path, dpi=300)
     plt.show()
     return fig
+
+
+def crs_depth_breakdown(image_crs_by_model, depth_df, species=None, n_bins=15, min_each=3):
+    """Is the rise in CRS at depth a change within species, or errors and species mix?
+
+    plot_crs_vs_depth pools every crop in a bin, so a bin's CRS also moves with its
+    share of misclassified crops (which have higher CRS) and with which species
+    live at that depth. Per bin this reports the pooled CRS, the share of wrong
+    crops, and CRS over correct crops with each species weighted equally. It also
+    compares each species with itself: mean correct-crop CRS on deep minus shallow
+    test crops, for species with >= min_each correct crops on each side, tested
+    with a Wilcoxon signed-rank test.
+
+    Args:
+        image_crs_by_model: dict model name -> image_crs table (both splits).
+        depth_df: DataFrame with columns image_id, depth_m.
+        species: optional list to restrict to.
+        n_bins: Number of equal-frequency depth bins (as in plot_crs_vs_depth).
+        min_each: minimum correct crops per split for the within-species test.
+
+    Returns:
+        (dict model -> per-bin DataFrame, dict model -> (median difference, p, n species))
+    """
+    from scipy.stats import wilcoxon
+
+    depth = depth_df[["image_id", "depth_m"]].drop_duplicates("image_id")
+    tables, within = {}, {}
+    for model, ic in image_crs_by_model.items():
+        df = ic if species is None else ic[ic["species"].isin(species)]
+        df = df.merge(depth, on="image_id", how="left").dropna(subset=["depth_m", "crs"])
+        df["bin_mid"] = pd.qcut(df["depth_m"], n_bins, duplicates="drop").apply(lambda b: round(b.mid))
+        right = df[df["correct"]]
+        tables[model] = pd.DataFrame({
+            "crs_all": df.groupby("bin_mid", observed=True)["crs"].mean(),
+            "share_wrong": 1 - df.groupby("bin_mid", observed=True)["correct"].mean(),
+            "crs_correct_species_weighted": right.groupby(["bin_mid", "species"], observed=True)["crs"]
+                                                 .mean().groupby("bin_mid").mean()})
+        g = right.groupby(["species", "split"])["crs"].agg(["mean", "count"]).unstack("split")
+        ok = (g[("count", "shallow")] >= min_each) & (g[("count", "deep")] >= min_each)
+        diffs = (g.loc[ok, ("mean", "deep")] - g.loc[ok, ("mean", "shallow")]).dropna()
+        within[model] = (float(diffs.median()), float(wilcoxon(diffs).pvalue), len(diffs))
+    return tables, within
+
+
+def crs_depth_consistency(image_crs, species=None, min_n=3):
+    """Is species CRS a stable property, or noise? Shallow vs deep species CRS.
+
+    Correlates each species' mean CRS on its correctly classified shallow test
+    crops with the same on its correctly classified deep crops (species with
+    >= min_n correct crops on each side). Organism size alone makes CRS
+    consistent (small organisms leave more background), so the correlation is
+    also reported partialled on shallow mask coverage (the flat-map CRS,
+    crs_chance) and on excess CRS (crs - chance). A high value means CRS ranks
+    species the same way on separate images; it does not mean shallow attention
+    causes deep attention (both come from the same frozen model).
+
+    Args:
+        image_crs: per-image CRS table (both splits) with species, split,
+            correct, crs, crs_chance and crs_excess.
+        species: optional list to restrict to.
+        min_n: minimum correct crops per split.
+
+    Returns:
+        dict with rho, p, partial_rho, partial_p, excess_rho, excess_p and n.
+    """
+    from scipy.stats import pearsonr
+
+    df = image_crs if species is None else image_crs[image_crs["species"].isin(species)]
+    df = df[df["correct"]].dropna(subset=["crs"])
+    g = df.groupby(["species", "split"])[["crs", "crs_chance", "crs_excess"]].mean().unstack("split")
+    n = df.groupby(["species", "split"]).size().unstack("split")
+    ok = (n["shallow"] >= min_n) & (n["deep"] >= min_n)
+    g = g[ok.reindex(g.index, fill_value=False)].dropna()
+
+    rho, p = spearmanr(g[("crs", "shallow")], g[("crs", "deep")])
+    rk = pd.DataFrame({"sh": g[("crs", "shallow")], "dp": g[("crs", "deep")],
+                       "cov": g[("crs_chance", "shallow")]}).rank()
+    resid = lambda y, x: y - np.polyval(np.polyfit(x, y, 1), x)
+    pr, pp = pearsonr(resid(rk["sh"], rk["cov"]), resid(rk["dp"], rk["cov"]))
+    ex, exp_ = spearmanr(g[("crs_excess", "shallow")], g[("crs_excess", "deep")])
+    print(f"Shallow vs deep species CRS (correct crops): rho = {rho:.3f}, p = {p:.2g}, n = {len(g)}; "
+          f"partial on mask coverage = {pr:.3f} (p = {pp:.2g}); excess CRS rho = {ex:.3f} (p = {exp_:.2g})")
+    return {"rho": float(rho), "p": float(p), "partial_rho": float(pr), "partial_p": float(pp),
+            "excess_rho": float(ex), "excess_p": float(exp_), "n": len(g)}
 
 
 def generate_summary_table(crs_scores, degradation_scores, rho, p_value,
